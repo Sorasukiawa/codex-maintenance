@@ -4,7 +4,7 @@
 
 ## 原生查询与文件检查
 
-先运行 `command -v codex`、`codex --version` 和相关 `--help`。已确认本机支持时，可使用：
+先定位 Codex：macOS/Linux 使用 `command -v codex`，Windows PowerShell 使用 `Get-Command codex`；再核对 `codex --version` 和相关 `--help`。已确认本机支持时，可使用：
 
 ```text
 codex plugin list --json
@@ -18,6 +18,7 @@ codex doctor --json
 查询产生的 JSON 可能含环境变量值、URL 或启动参数。程序捕获后选择允许展示的字段，再输出结果；不要先把原始敏感值送进对话再脱敏。
 
 - Codex 常见位置：`${CODEX_HOME:-$HOME/.codex}` 下的 `config.toml`、`skills`、`skills/.system`、`plugins/cache`；项目还可能有 `.agents/skills`、`.codex/config.toml`。`~/.agents/skills` 可能是另一个有效入口或链接。
+- Windows 对应 `$env:CODEX_HOME`，未设置时从 `$env:USERPROFILE\.codex` 核对。原生 Windows 与 WSL 各有环境和路径，不依据另一侧的安装数量判断缺失。其他客户端配置按其实际配置位置查找，不套用 macOS Application Support 路径。
 - macOS 常见其他客户端入口：`~/.claude`、`~/.cursor/mcp.json`、`~/.gemini/config/mcp_config.json` 和 `~/Library/Application Support` 中对应客户端的用户设置。只检查实际存在且在任务范围内的路径。
 - macOS Codex 运行时通常位于 `~/.cache/codex-runtimes`，但应通过当前配置、应用与进程路径核实；独立项目运行时不自动归为残留。
 - 先用 `rg --files --hidden` 找目标文件，排除 `.git`、依赖和构建目录。统计目录时用 `lstat` 区分链接，避免把 `latest` 或共享源再次计算成独立安装。
@@ -46,6 +47,8 @@ def git_blob_sha(data: bytes) -> str:
 ## 清理证据
 
 用 `lsof -nP -F pn` 等平台工具读取句柄，再筛选候选目录的精确路径边界；输出中只保留任务相关路径。搜索当前配置、插件启动配置、市场根和相关服务配置中的引用。对“无引用”注明检查范围，不声称全盘绝对不存在引用。
+
+Windows 没有 `lsof` 时，可使用资源监视器的“关联的句柄”或已安装的 Sysinternals Handle 精确查找；`Get-Process` 只能补充进程证据，不能证明目录没有打开句柄。不要为维护自动强制结束进程、关闭句柄或删除 junction 的目标。Windows 路径中的盘符、空格和反斜杠按原生语法处理。
 
 记录目录身份与大小后，在删除前复核；删除使用核实后的确切路径。保留校验与执行结果用于复查，不把本次执行脚本中的绝对路径或临时目录名写入长期 skill。
 
