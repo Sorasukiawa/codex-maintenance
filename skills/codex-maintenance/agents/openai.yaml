@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 组件维护"
+  short_description: "检查本地 skills、MCP 和插件的更新、重复与安装残留"
+  default_prompt: "使用 $codex-maintenance 检查本机 skills、MCP 和插件；官方管理版本不手动更新、不重复安装，并按本次授权完成维护和验证。"
