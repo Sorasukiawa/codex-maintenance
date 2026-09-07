@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.11'
+            parser: pyyaml
+          - os: macos-latest
+            python: '3.13'
+            parser: ruby
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install YAML parser in CI
+        if: matrix.parser == 'pyyaml'
+        run: python -m pip install 'PyYAML>=6,<7'
+      - name: Verify existing Ruby parser
+        if: matrix.parser == 'ruby'
+        run: |
+          python -c "import importlib.util; assert importlib.util.find_spec('yaml') is None"
+          ruby -ryaml -e 'YAML.safe_load("name: example")'
+      - name: Test isolated maintenance operations
+        run: python -B -m unittest discover -s skills/codex-maintenance/tests -v
+      - name: Validate skill metadata
+        run: python -B skills/codex-maintenance/scripts/maintenance.py validate skills/codex-maintenance
