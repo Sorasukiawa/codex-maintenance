@@ -3,7 +3,7 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+import errno
 from functools import lru_cache
 import hashlib
 import json
@@ -37,12 +37,25 @@ def absolute(path):
     return Path(os.path.abspath(Path(path).expanduser()))
 
 
+def is_link(path, info=None):
+    """Include Windows junctions and other reparse points on Python 3.11+."""
+    try:
+        info = info or Path(path).lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 0x400)
+
+
+def linked_path(path):
+    return any(is_link(p) for p in (path, *path.parents))
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix='.maintenance-', dir=path.parent)
     try:
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
             json.dump(value, stream, ensure_ascii=False, indent=2)
             stream.write('\n')
             stream.flush()
@@ -57,7 +70,7 @@ def snapshot(path):
     """Hash all entries, modes and link text; never traverse directory symlinks."""
     path = absolute(path)
     root = path.lstat()
-    if not stat.S_ISDIR(root.st_mode):
+    if is_link(path, root) or not stat.S_ISDIR(root.st_mode):
         raise MaintenanceError('Snapshot root must be a real directory')
     files = {}
     def walk(folder):
@@ -66,6 +79,8 @@ def snapshot(path):
             row = {'mode': stat.S_IMODE(info.st_mode)}
             if stat.S_ISLNK(info.st_mode):
                 row.update(type='symlink', target=os.readlink(item))
+            elif is_link(item, info):
+                row.update(type='reparse-point', tag=getattr(info, 'st_reparse_tag', None))
             elif stat.S_ISDIR(info.st_mode):
                 row.update(type='directory')
             elif stat.S_ISREG(info.st_mode):
@@ -102,7 +117,7 @@ def parse_yaml(text):
         if not ruby:
             raise MaintenanceError('YAML parser unavailable: use an existing PyYAML or Ruby Psych runtime')
         code = 'v=YAML.safe_load(STDIN.read, permitted_classes: [], aliases: false); STDOUT.write(JSON.generate(v))'
-        result = subprocess.run([ruby, '-rjson', '-ryaml', '-e', code], input=text, text=True,
+        result = subprocess.run([ruby, '-EUTF-8:UTF-8', '-rjson', '-ryaml', '-e', code], input=text, encoding='utf-8',
                                 capture_output=True, timeout=20)
         if result.returncode:
             raise MaintenanceError('Invalid YAML (parser details omitted to avoid exposing values)')
@@ -114,7 +129,7 @@ def parse_yaml(text):
 
 
 def skill_metadata(path):
-    text = (path / 'SKILL.md').read_text()
+    text = (path / 'SKILL.md').read_text(encoding='utf-8-sig')
     match = re.match(r'\A---\r?\n(.*?)\r?\n---(?:\r?\n|$)', text, re.S)
     if not match:
         raise MaintenanceError('Missing skill YAML frontmatter')
@@ -126,7 +141,7 @@ def skill_metadata(path):
     ui_path = path / 'agents' / 'openai.yaml'
     implicit = 'default'
     if ui_path.exists():
-        ui = parse_yaml(ui_path.read_text())
+        ui = parse_yaml(ui_path.read_text(encoding='utf-8-sig'))
         if not isinstance(ui, dict):
             raise MaintenanceError('Invalid agents/openai.yaml mapping')
         policy = ui.get('policy', {})
@@ -140,7 +155,7 @@ def skill_metadata(path):
 
 
 def instance_id(path):
-    return digest(str(absolute(path)))[:20]
+    return digest(os.path.normcase(str(absolute(path))))[:20]
 
 
 def mcp_rows(mapping, source, errors=None):
@@ -166,7 +181,7 @@ def mcp_rows(mapping, source, errors=None):
             continue
         command = value.get('command')
         command_exists = None
-        if isinstance(command, str) and command.startswith('/'):
+        if isinstance(command, str) and Path(command).is_absolute():
             command_exists = Path(command).is_file()
         rows.append({'name': name, 'source': source, 'enabled': value.get('enabled', 'unspecified'),
                      'transport': 'url' if value.get('url') else 'stdio', 'absolute_command_exists': command_exists,
@@ -186,16 +201,33 @@ def inventory(home):
     cfg = home / 'config.toml'
     if cfg.exists():
         try:
-            config = tomllib.loads(cfg.read_text())
+            config = tomllib.loads(cfg.read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
             report['errors'].append({'path': str(cfg), 'error': 'config parse failed; values omitted'})
     report['mcp'] += mcp_rows(config.get('mcp_servers', {}), 'user-config', report['errors'])
     seen = set()
+    def alias(path, owner):
+        report['aliases'].append({'path': str(path), 'target': str(path.resolve()), 'owner': owner})
+
+    def directories(folder, owner):
+        if linked_path(folder):
+            alias(folder, owner)
+            return
+        if folder.is_dir():
+            for path in sorted(folder.iterdir()):
+                if is_link(path):
+                    alias(path, owner)
+                elif path.is_dir():
+                    yield path
+
     def skill(path, owner, plugin_id=None):
-        if path.is_symlink():
-            report['aliases'].append({'path': str(path), 'target': str(path.resolve()), 'owner': owner})
+        if is_link(path):
+            alias(path, owner)
             return
         if not (path / 'SKILL.md').is_file():
+            return
+        if is_link(path / 'SKILL.md'):
+            alias(path / 'SKILL.md', owner)
             return
         real = str(path.resolve())
         if real in seen:
@@ -212,42 +244,62 @@ def inventory(home):
             report['errors'].append({'path': str(path), 'error': message})
         report['skills'].append(row)
     for base, owner in [(home / 'skills', 'user'), (home / 'skills' / '.system', 'system')]:
-        if base.is_dir():
-            for path in sorted(base.iterdir()):
-                if not path.name.startswith('.'):
-                    skill(path, owner)
+        for path in directories(base, owner):
+            if not path.name.startswith('.'):
+                skill(path, owner)
     cache = home / 'plugins' / 'cache'
-    if cache.is_dir():
-        for manifest in sorted(cache.glob('*/*/*/.codex-plugin/plugin.json')):
-            root = manifest.parent.parent
-            if any(p.is_symlink() for p in [root, root.parent, root.parent.parent]):
-                report['aliases'].append({'path': str(root), 'target': str(root.resolve()), 'owner': 'plugin'})
-                continue
-            plugin_id = root.parent.name + '@' + root.parent.parent.name
-            try:
-                data = json.loads(manifest.read_text())
-                report['plugins'].append({'id': plugin_id, 'path': str(root), 'version': data.get('version', root.name),
-                                          'enabled_in_user_config': config.get('plugins', {}).get(plugin_id, {}).get('enabled', 'unspecified'),
-                                          'managed': True, 'effective_state': 'requires-native-query'})
-                for path in sorted(root.rglob('SKILL.md')):
-                    relative = path.relative_to(root)
-                    if any(part.startswith('.') or part in ('node_modules', '__pycache__') for part in relative.parts):
-                        continue
-                    skill(path.parent, 'plugin', plugin_id)
-                mcp = root / '.mcp.json'
-                if mcp.is_file():
-                    report['mcp'] += mcp_rows(json.loads(mcp.read_text()).get('mcpServers', {}), plugin_id, report['errors'])
-            except (OSError, ValueError, AttributeError):
-                report['errors'].append({'path': str(manifest), 'error': 'plugin parse failed; values omitted'})
+    def plugin_roots():
+        for market in directories(cache, 'plugin'):
+            for package in directories(market, 'plugin'):
+                yield from directories(package, 'plugin')
+
+    def plugin_skills(folder):
+        yield folder
+        for child in directories(folder, 'plugin'):
+            if not child.name.startswith('.') and child.name not in ('node_modules', '__pycache__'):
+                yield from plugin_skills(child)
+
+    for root in plugin_roots():
+        manifest = root / '.codex-plugin' / 'plugin.json'
+        if linked_path(manifest):
+            alias(manifest, 'plugin')
+            continue
+        if not manifest.is_file():
+            continue
+        plugin_id = root.parent.name + '@' + root.parent.parent.name
+        try:
+            data = json.loads(manifest.read_text(encoding='utf-8-sig'))
+            report['plugins'].append({'id': plugin_id, 'path': str(root), 'version': data.get('version', root.name),
+                                      'enabled_in_user_config': config.get('plugins', {}).get(plugin_id, {}).get('enabled', 'unspecified'),
+                                      'managed': True, 'effective_state': 'requires-native-query'})
+            for path in plugin_skills(root):
+                skill(path, 'plugin', plugin_id)
+            mcp = root / '.mcp.json'
+            if is_link(mcp):
+                alias(mcp, 'plugin')
+            elif mcp.is_file():
+                report['mcp'] += mcp_rows(json.loads(mcp.read_text(encoding='utf-8-sig')).get('mcpServers', {}), plugin_id, report['errors'])
+        except (OSError, ValueError, AttributeError):
+            report['errors'].append({'path': str(manifest), 'error': 'plugin parse failed; values omitted'})
     report['counts'] = {owner: sum(s['owner'] == owner for s in report['skills']) for owner in ('user', 'system', 'plugin')}
     return report
 
 
 def git_files(tree):
     # Generated Python caches are excluded from upstream comparison only, never backups/drift checks.
-    return {p: {'git_sha': v['git_sha'], 'executable': bool(v['mode'] & 0o111)}
+    return {p: {'git_sha': v['git_sha'], 'executable': None if os.name == 'nt' else bool(v['mode'] & 0o111)}
             for p, v in tree['files'].items() if v['type'] == 'file' and not p.endswith('.pyc')
             and '__pycache__' not in Path(p).parts}
+
+
+def diff_git_maps(before, after):
+    # Windows does not expose Git/POSIX executable bits; None means incomparable.
+    result = diff_maps(before, after)
+    result['changed'] = sorted(k for k in before.keys() & after.keys()
+                               if before[k]['git_sha'] != after[k]['git_sha'] or
+                               (before[k].get('executable') is not None and after[k].get('executable') is not None
+                                and before[k]['executable'] != after[k]['executable']))
+    return result
 
 
 @lru_cache(maxsize=32)
@@ -305,7 +357,7 @@ def resolve_ref(repo, ref):
 def user_target(home, path):
     home, path = absolute(home), absolute(path)
     base = home / 'skills'
-    if home.resolve() != home or base.resolve() != base or path.parent != base or path.name.startswith('.') or path.is_symlink():
+    if linked_path(path) or path.parent != base or path.name.startswith('.'):
         raise MaintenanceError('Only real, direct user skill directories are supported; managed paths and links are excluded')
     return path
 
@@ -313,23 +365,69 @@ def user_target(home, path):
 @contextmanager
 def state_lock(home):
     state = absolute(home) / 'maintenance'
-    if state.resolve() != state:
-        raise MaintenanceError('Maintenance state must not be a symlink')
+    if linked_path(state):
+        raise MaintenanceError('Maintenance state must not contain links or reparse points')
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = state / '.lock'
-    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = open_lock(lock)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise MaintenanceError('Another maintenance operation holds the lock') from None
+            raise
         yield state
-    except BlockingIOError:
-        raise MaintenanceError('Another maintenance operation holds the lock') from None
     finally:
+        # Closing releases the OS lock, including after process termination.
         os.close(fd)
+
+
+def open_lock(path):
+    if is_link(path):
+        raise MaintenanceError('Lock must be a regular file, not a link or reparse point')
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        close = kernel.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        close.restype = wintypes.BOOL
+        # Open the reparse point itself; deny delete-sharing so the lock cannot be replaced while held.
+        handle = create(str(path), 0xC0000000, 0x3, None, 4, 0x00200080, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY | os.O_NOINHERIT)
+        except BaseException:
+            close(handle)
+            raise
+    else:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info, opened = path.lstat(), os.fstat(fd)
+        if is_link(path, info) or not stat.S_ISREG(opened.st_mode) or not os.path.samestat(info, opened):
+            raise MaintenanceError('Lock file changed or is not a regular file')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def registry(home):
     path = absolute(home) / 'maintenance' / 'registry.json'
-    return json.loads(path.read_text()) if path.exists() else {'schema': 1, 'entries': {}}
+    return json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {'schema': 1, 'entries': {}}
 
 
 def register(home, path, repo=None, subdir=None, commit=None, ref='main', note=''):
@@ -345,7 +443,8 @@ def register(home, path, repo=None, subdir=None, commit=None, ref='main', note='
     entry = {'id': instance_id(path), 'path': str(path), 'name': metadata['name'], 'registered_at': now(),
              'source': source, 'source_status': 'confirmed' if source else 'local-or-unknown', 'note': note,
              'baseline_local': local, 'baseline_fingerprint': snap['fingerprint'], 'upstream_files': upstream,
-             'customization': diff_maps(upstream, local) if source else None,
+             'customization': diff_git_maps(upstream, local) if source else None,
+             'local_executable_bits_comparable': os.name != 'nt',
              'implicit_invocation': metadata['implicit_invocation']}
     with state_lock(home) as state:
         data = registry(home)
@@ -366,7 +465,8 @@ def check_updates(home):
         try:
             snap = snapshot(entry['path'])
             local = git_files(snap)
-            row['local_since_registration'] = diff_maps(entry['baseline_local'], local)
+            row['local_since_registration'] = diff_git_maps(entry['baseline_local'], local)
+            row['local_executable_bits_comparable'] = os.name != 'nt'
             row['full_local_fingerprint_changed'] = snap['fingerprint'] != entry['baseline_fingerprint']
             source = entry['source']
             if source:
@@ -374,7 +474,7 @@ def check_updates(home):
                 current = github_tree(source['repo'], source['subdir'], sha)
                 difference = diff_maps(entry['upstream_files'], current)
                 row.update(status='checked', upstream_commit=sha, upstream_diff=difference,
-                           upstream_changed=any(difference.values()), local_vs_upstream=diff_maps(current, local))
+                           upstream_changed=any(difference.values()), local_vs_upstream=diff_git_maps(current, local))
             else:
                 row['status'] = 'local-or-unknown-source'
         except (MaintenanceError, OSError, ValueError) as error:
@@ -384,14 +484,14 @@ def check_updates(home):
 
 
 def no_links(tree):
-    if any(v['type'] == 'symlink' for v in tree['files'].values()):
-        raise MaintenanceError('Directory contains symlinks; inspect and maintain this package manually')
+    if any(v['type'] in ('symlink', 'reparse-point') for v in tree['files'].values()):
+        raise MaintenanceError('Directory contains links or reparse points; inspect and maintain this package manually')
 
 
 def make_plan(home, target, candidate):
     target = user_target(home, target)
     candidate = absolute(candidate)
-    if candidate.resolve() != candidate or candidate == target or target in candidate.parents or candidate in target.parents:
+    if linked_path(candidate) or candidate == target or target in candidate.parents or candidate in target.parents:
         raise MaintenanceError('Candidate must be a separate real directory')
     before_meta, after_meta = skill_metadata(target), skill_metadata(candidate)
     if before_meta['name'] != after_meta['name']:
@@ -423,7 +523,7 @@ def apply_plan(home, plan):
         raise MaintenanceError('Plan integrity or CODEX_HOME mismatch')
     target = user_target(home, plan['target'])
     candidate = absolute(plan['candidate'])
-    if candidate.resolve() != candidate:
+    if linked_path(candidate):
         raise MaintenanceError('Candidate path now contains a symlink')
     require_snapshot(target, plan['diff']['before'])
     require_snapshot(candidate, plan['diff']['after'])
@@ -432,7 +532,7 @@ def apply_plan(home, plan):
         if not re.fullmatch(r'[0-9a-f]{32}', operation_id):
             raise MaintenanceError('Invalid operation ID')
         folder = state / 'backups' / operation_id
-        if folder.parent.resolve() != folder.parent:
+        if linked_path(folder.parent):
             raise MaintenanceError('Backup parent must not be a symlink')
         folder.mkdir(parents=True, mode=0o700, exist_ok=False)
         staged, backup = folder / 'staged', folder / 'original'
@@ -465,9 +565,9 @@ def rollback(home, operation_id):
         raise MaintenanceError('Invalid operation ID')
     with state_lock(home) as state:
         folder = state / 'backups' / operation_id
-        if folder.resolve() != folder:
+        if linked_path(folder):
             raise MaintenanceError('Backup must not be a symlink')
-        receipt = json.loads((folder / 'receipt.json').read_text())
+        receipt = json.loads((folder / 'receipt.json').read_text(encoding='utf-8-sig'))
         target = user_target(home, receipt['target'])
         backup, displaced = folder / 'original', folder / 'displaced'
         require_snapshot(backup, receipt['plan']['diff']['before'])
@@ -527,7 +627,7 @@ def main():
         elif args.command == 'plan':
             result = make_plan(args.home, args.target, args.candidate)
         elif args.command == 'apply':
-            result = apply_plan(args.home, json.loads(args.plan_file.read_text()))
+            result = apply_plan(args.home, json.loads(args.plan_file.read_text(encoding='utf-8-sig')))
         elif args.command == 'rollback':
             result = rollback(args.home, args.operation_id)
         else:
@@ -535,7 +635,8 @@ def main():
         if args.output:
             write_json(args.output, result)
         else:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            # ASCII JSON preserves Unicode values across legacy Windows pipes/code pages.
+            print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     except Exception as error:
         # Parser/network error payloads can contain credentials. Keep diagnostics deliberately narrow.

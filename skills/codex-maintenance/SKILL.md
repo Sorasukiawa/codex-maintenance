@@ -15,6 +15,8 @@ description: Use when the user asks to audit, update, deduplicate, organize, or 
 
 优先用随附 [maintenance.py](scripts/maintenance.py) 完成重复检查。命令、状态台账和更新/回滚示例见 [脚本使用](references/automation.md)；原生查询、来源核对和清理证据见 [核对参考](references/checks.md)。不要每次重写一个临时管理器。
 
+支持原生 Windows、macOS 和 Linux，需 Python 3.11+ 及已有 YAML 解析器。Windows 使用 PowerShell 示例与原生 Python；核对当前环境的 `CODEX_HOME`，不要把 WSL 和 Windows 安装视为同一套。junction / 重解析点按链接处理，可执行位在 Windows 上不可据此判定本地定制。
+
 ## 盘点与判定
 
 1. 定位实际 `CODEX_HOME`、用户与系统 skills、插件版本目录和市场来源。脚本 `inventory` 只读统计这三类，记录声明名、路径 ID、哈希、调用策略、插件归属与链接。相同名字不能合并成一条；`latest` 别名不算第二个物理安装。

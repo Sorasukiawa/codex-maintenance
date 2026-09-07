@@ -20,6 +20,12 @@ jobs:
           - os: macos-latest
             python: '3.13'
             parser: ruby
+          - os: windows-latest
+            python: '3.11'
+            parser: pyyaml
+          - os: windows-latest
+            python: '3.13'
+            parser: pyyaml
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     env:

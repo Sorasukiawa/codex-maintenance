@@ -4,7 +4,7 @@
 
 面向 Codex 的本地组件维护 skill：盘点 skills、MCP 和插件，区分官方管理与独立安装，保留本地定制，并为用户 skill 更新提供预览、备份和回滚。
 
-这是一个社区项目，与 OpenAI 无隶属关系。当前版本适合在 macOS/Linux 上维护个人 Codex 环境。
+这是一个社区项目，与 OpenAI 无隶属关系。支持在原生 Windows、macOS 和 Linux 上维护个人 Codex 环境。
 
 ## 它解决什么问题
 
@@ -49,6 +49,18 @@ python3 -B skills/codex-maintenance/scripts/maintenance.py inventory
 python3 -B skills/codex-maintenance/scripts/maintenance.py check-updates
 ```
 
+Windows PowerShell 使用已有的 Python 3.11+，例如 `py -3`（若 `python` 指向正确版本，也可替换）：
+
+```powershell
+py -3 --version
+$tool = '.\skills\codex-maintenance\scripts\maintenance.py'
+$codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+py -3 -B $tool --home $codexRoot --output .\work\inventory.json inventory
+py -3 -B $tool --home $codexRoot check-updates
+```
+
+优先复用已有 YAML 解析器；若需主动为该 Windows 解释器配置 PyYAML，可手动运行 `py -3 -m pip install 'PyYAML>=6,<7'`，skill 不会自行安装。支持中文、繁中、日文与空格路径，文本按 UTF-8 读取，兼容 BOM/CRLF；JSON 文件保存为 UTF-8，控制台 JSON 对 Unicode 使用转义以兼容旧代码页。
+
 | 命令 | 行为 |
 | --- | --- |
 | `inventory` | 只读盘点配置与目录，不测试 MCP 握手 |
@@ -65,7 +77,9 @@ python3 -B skills/codex-maintenance/scripts/maintenance.py check-updates
 
 - 默认扫描 `CODEX_HOME/skills`、`.system`、标准插件缓存布局及用户 `config.toml`。`~/.agents/skills`、项目级入口和其他客户端需要 agent 补查。
 - 缓存存在不代表有效启用；原生列表与握手状态需要另行核对。同名禁用 MCP 覆盖项不视为垃圾。
-- 自动替换限于 `CODEX_HOME/skills` 的真实直接子目录；系统、插件、含软链接的包不由更新脚本处理。Windows 不支持 `fcntl` 锁。
+- 自动替换限于 `CODEX_HOME/skills` 的真实直接子目录；系统、插件、含符号链接、junction 或其他重解析点的包不由更新脚本处理。
+- Windows 使用原生文件句柄与 `msvcrt` 锁，macOS/Linux 使用 `fcntl`。Windows 验证范围是普通本地目录，不涵盖 OneDrive 占位文件与网络共享；POSIX 可执行位标为未知，不据此误报本地定制，不检查 ACL。
+- Windows 文件被占用时可能无法重命名目录；关闭使用该 skill 的程序，核对回执和保留目录，再重新生成计划。WSL 维护自己的 Linux 环境，经 `/mnt/c` 维护 Windows 安装不在本次验证范围内。
 - 不自动做语义合并、下载候选、卸载插件或通用缓存删除。来源不明或联网失败保持未知。
 - 两次目录重命名之间存在短暂缺位窗口，不承诺整个更新过程原子或断电持久化。锁仅协调本脚本。
 
@@ -78,7 +92,7 @@ python3 -B -m unittest discover -s skills/codex-maintenance/tests -v
 python3 -B skills/codex-maintenance/scripts/maintenance.py validate skills/codex-maintenance
 ```
 
-测试使用临时 `CODEX_HOME`，GitHub 检查使用固定测试数据，不连接真实 MCP。GitHub Actions 在 macOS/Linux 上运行测试，并分别覆盖 Ruby Psych 和 PyYAML 解析路径。
+测试使用临时 `CODEX_HOME`，GitHub 检查使用固定测试数据，不连接真实 MCP。GitHub Actions 覆盖原生 Windows（Python 3.11、3.13）、macOS、Linux，以及 Ruby Psych 和 PyYAML 解析路径。Windows 测试实际创建 junction、竞争进程锁、占用文件，并验证更新与回滚。
 
 欢迎提交带最小复现的 issue 或 PR，特别是不同 Codex 安装布局、配置格式和恢复情形。请保持维护范围清晰，并为行为变化增加有意义的测试。
 
