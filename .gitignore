@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+.env
+.env.*
+/work/
+/outputs/
+/maintenance/
+registry.json
+**/backups/
+**/registry-history/
+*.pem
+*.key
