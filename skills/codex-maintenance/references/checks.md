@@ -32,6 +32,8 @@ codex doctor --json
 
 对当前机器逐条核实来源并登记，不随分发包携带任何人的安装台账。仓库路径和声明名称可能不同；旧报告只提供线索，本地定制可能比公开版本包含更多功能。
 
+本地自编或定制版本可能比公开版本包含更多功能。具体机器的已安装集合、上游映射和历史定制记录放在机器台账或本轮报告，不写成分发 skill 的默认安装清单。
+
 确定上游后读取当前默认分支的提交 SHA，再按固定 SHA 比对目录树。GitHub API 的 tree 响应必须确认未截断；列出相同、不同、本地独有、上游独有四类。文件 blob SHA 可用下面的纯标准库函数核对；它比文件时间可靠：
 
 ```python
@@ -46,6 +48,8 @@ def git_blob_sha(data: bytes) -> str:
 
 ## 清理证据
 
+执行清单记录绝对及真实路径、类型、设备/inode、内容归属、实际占用、最近写入、配置引用和打开句柄。名字像 `cache` 或 `install-*` 仅用于发现候选；用途相近不能证明冗余。记录清理前后磁盘空闲量，区分对象原占用与实际空闲变化。链接本身与目标分别检查，不沿链接递归删除。
+
 用 `lsof -nP -F pn` 等平台工具读取句柄，再筛选候选目录的精确路径边界；输出中只保留任务相关路径。搜索当前配置、插件启动配置、市场根和相关服务配置中的引用。对“无引用”注明检查范围，不声称全盘绝对不存在引用。
 
 Windows 没有 `lsof` 时，可使用资源监视器的“关联的句柄”或已安装的 Sysinternals Handle 精确查找；`Get-Process` 只能补充进程证据，不能证明目录没有打开句柄。不要为维护自动强制结束进程、关闭句柄或删除 junction 的目标。Windows 路径中的盘符、空格和反斜杠按原生语法处理。
@@ -56,6 +60,7 @@ Windows 没有 `lsof` 时，可使用资源监视器的“关联的句柄”或�
 
 产品行为有疑问时先核对本机 CLI/配置能力，再按需读取最新官方说明，不以历史说明覆盖当前能力：
 
-- [Build skills](https://learn.chatgpt.com/docs/build-skills)
+- [Build skills](https://developers.openai.com/plugins/build/skills)
+- [Package your plugin](https://developers.openai.com/plugins/build/plugins)：新旧 manifest、组件入口和优先级
 - [Plugins](https://learn.chatgpt.com/docs/plugins)
 - [Model Context Protocol](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)

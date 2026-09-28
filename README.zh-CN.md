@@ -46,6 +46,8 @@ skill 的说明目前以中文编写；可要求 agent 使用你的语言回复�
 ```sh
 python3 -B skills/codex-maintenance/scripts/maintenance.py --help
 python3 -B skills/codex-maintenance/scripts/maintenance.py inventory
+# 需要完整内容哈希时：
+python3 -B skills/codex-maintenance/scripts/maintenance.py inventory --deep
 python3 -B skills/codex-maintenance/scripts/maintenance.py check-updates
 ```
 
@@ -63,19 +65,24 @@ py -3 -B $tool --home $codexRoot check-updates
 
 | 命令 | 行为 |
 | --- | --- |
-| `inventory` | 只读盘点配置与目录，不测试 MCP 握手 |
+| `inventory` | 默认只读元数据；加 `--deep` 才计算完整内容哈希，不测试 MCP 握手 |
 | `register` | 持久保存一个已核实来源或本地基线，不安装 skill |
-| `check-updates` | 只读查询已登记的公开 GitHub 来源，不下载执行内容 |
+| `check-updates` | 对账用户安装与台账，查询已确认的公开 GitHub 来源，并列出未登记、未知来源和失败 |
 | `compare` / `plan` | 比较完整候选目录，生成更新预览 |
 | `apply` | 执行已审阅且处于用户授权范围内的计划，保留备份 |
 | `rollback` | 在替换版本未发生后续改动时恢复旧目录 |
 | `validate` | 检查 skill 元数据和调用策略 |
+
+盘点批量解析 YAML，减少 Ruby 后备解析器的进程启动开销，单个坏文档不影响其他有效项。每次重新读取文件和调用策略，不使用跨次文件缓存。
+
+盘点及更新报告使用 `schema=2`；需要盘点指纹的调用者改用 `inventory --deep`。台账、计划和回执仍使用 schema 1。更新检查附覆盖汇总，零更新不代表未登记、未知来源或失败项目已是最新；读取失败保留部分结果与脱敏原因码。
 
 可用 `--home` 指定实际 `CODEX_HOME`，`--output` 保存 JSON；这两个全局参数放在子命令之前。完整例子和恢复流程见 [脚本参考](skills/codex-maintenance/references/automation.md)。
 
 ## 范围与限制
 
 - 默认扫描 `CODEX_HOME/skills`、`.system`、标准插件缓存布局及用户 `config.toml`。`~/.agents/skills`、项目级入口和其他客户端需要 agent 补查。
+- 同时识别 portable 根目录 `plugin.json`、`skills/`、`mcp.json` 和 legacy `.codex-plugin/plugin.json` 声明路径；新旧 manifest 并存不重复统计，显式声明路径缺失会记录错误。
 - 缓存存在不代表有效启用；原生列表与握手状态需要另行核对。同名禁用 MCP 覆盖项不视为垃圾。
 - 自动替换限于 `CODEX_HOME/skills` 的真实直接子目录；系统、插件、含符号链接、junction 或其他重解析点的包不由更新脚本处理。
 - Windows 使用原生文件句柄与 `msvcrt` 锁，macOS/Linux 使用 `fcntl`。Windows 验证范围是普通本地目录，不涵盖 OneDrive 占位文件与网络共享；POSIX 可执行位标为未知，不据此误报本地定制，不检查 ACL。

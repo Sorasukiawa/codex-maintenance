@@ -17,12 +17,27 @@ import sys
 import tempfile
 import tomllib
 from urllib.parse import quote
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import uuid
 
 
 class MaintenanceError(Exception):
-    pass
+    def __init__(self, message, code='maintenance-error'):
+        super().__init__(message)
+        self.code = code
+
+
+def error_info(error):
+    """Only our own messages are safe to report; parser/OS payloads may contain secrets."""
+    if isinstance(error, MaintenanceError):
+        return {'code': error.code, 'error': str(error)}
+    codes = {PermissionError: 'permission-denied', FileNotFoundError: 'path-missing',
+             TimeoutError: 'timeout', subprocess.TimeoutExpired: 'timeout',
+             ValueError: 'invalid-data', TypeError: 'invalid-data', KeyError: 'invalid-data',
+             OSError: 'filesystem-error'}
+    code = next((code for kind, code in codes.items() if isinstance(error, kind)), 'unexpected-error')
+    return {'code': code, 'error': type(error).__name__ + '; details omitted'}
 
 
 def now():
@@ -109,39 +124,75 @@ def compare(before, after):
             'before': left, 'after': right}
 
 
-def parse_yaml(text):
+def parse_yaml_batch(texts):
+    """Parse independently, amortizing Ruby startup without caching mutable files."""
+    if not texts:
+        return []
     try:
         import yaml
     except ImportError:
         ruby = shutil.which('ruby')
         if not ruby:
-            raise MaintenanceError('YAML parser unavailable: use an existing PyYAML or Ruby Psych runtime')
-        code = 'v=YAML.safe_load(STDIN.read, permitted_classes: [], aliases: false); STDOUT.write(JSON.generate(v))'
-        result = subprocess.run([ruby, '-EUTF-8:UTF-8', '-rjson', '-ryaml', '-e', code], input=text, encoding='utf-8',
-                                capture_output=True, timeout=20)
+            raise MaintenanceError('YAML parser unavailable: use an existing PyYAML or Ruby Psych runtime',
+                                   'yaml-parser-unavailable')
+        code = """values = JSON.parse(STDIN.read).map do |text|
+  begin
+    value = YAML.safe_load(text, permitted_classes: [], aliases: false)
+    JSON.parse(JSON.generate({value: value}))
+  rescue Psych::Exception, ArgumentError, JSON::GeneratorError, EncodingError
+    {error: true}
+  end
+end
+STDOUT.write(JSON.generate(values))"""
+        result = subprocess.run([ruby, '-EUTF-8:UTF-8', '-rjson', '-ryaml', '-e', code],
+                                input=json.dumps(texts), encoding='utf-8', capture_output=True, timeout=20)
         if result.returncode:
-            raise MaintenanceError('Invalid YAML (parser details omitted to avoid exposing values)')
-        return json.loads(result.stdout)
-    try:
-        return yaml.safe_load(text)
-    except yaml.YAMLError:
-        raise MaintenanceError('Invalid YAML') from None
+            raise MaintenanceError('YAML parser failed; details omitted', 'yaml-parser-failed')
+        values = json.loads(result.stdout)
+        if not isinstance(values, list) or len(values) != len(texts) or not all(isinstance(v, dict) for v in values):
+            raise MaintenanceError('Invalid YAML parser response; details omitted', 'yaml-parser-failed')
+        return [MaintenanceError('Invalid YAML', 'invalid-yaml') if value.get('error') else value['value']
+                for value in values]
+    values = []
+    for text in texts:
+        try:
+            values.append(yaml.safe_load(text))
+        except yaml.YAMLError:
+            values.append(MaintenanceError('Invalid YAML', 'invalid-yaml'))
+    return values
 
 
-def skill_metadata(path):
+def yaml_value(value):
+    if isinstance(value, MaintenanceError):
+        raise value
+    return value
+
+
+def parse_yaml(text):
+    return yaml_value(parse_yaml_batch([text])[0])
+
+
+def skill_documents(path):
     text = (path / 'SKILL.md').read_text(encoding='utf-8-sig')
     match = re.match(r'\A---\r?\n(.*?)\r?\n---(?:\r?\n|$)', text, re.S)
     if not match:
         raise MaintenanceError('Missing skill YAML frontmatter')
-    data = parse_yaml(match.group(1))
+    documents = [match.group(1)]
+    ui_path = path / 'agents' / 'openai.yaml'
+    if ui_path.exists():
+        documents.append(ui_path.read_text(encoding='utf-8-sig'))
+    return documents
+
+
+def metadata_from_values(values):
+    data = yaml_value(values[0])
     if not isinstance(data, dict) or not isinstance(data.get('name'), str) or not data['name'].strip():
         raise MaintenanceError('Invalid skill name')
     if not isinstance(data.get('description'), str) or not data['description'].strip():
         raise MaintenanceError('Missing skill description')
-    ui_path = path / 'agents' / 'openai.yaml'
     implicit = 'default'
-    if ui_path.exists():
-        ui = parse_yaml(ui_path.read_text(encoding='utf-8-sig'))
+    if len(values) > 1:
+        ui = yaml_value(values[1])
         if not isinstance(ui, dict):
             raise MaintenanceError('Invalid agents/openai.yaml mapping')
         policy = ui.get('policy', {})
@@ -154,19 +205,23 @@ def skill_metadata(path):
             'name_matches_authoring_convention': bool(re.fullmatch(r'[a-z0-9-]{1,64}', data['name']))}
 
 
+def skill_metadata(path):
+    return metadata_from_values(parse_yaml_batch(skill_documents(path)))
+
+
 def instance_id(path):
     return digest(os.path.normcase(str(absolute(path))))[:20]
 
 
-def mcp_rows(mapping, source, errors=None):
+def mcp_rows(mapping, source, errors=None, portable=False):
     rows = []
     errors = errors if errors is not None else []
     if not isinstance(mapping, dict):
-        errors.append({'source': source, 'error': 'MCP collection must be a mapping; values omitted'})
+        errors.append({'source': source, 'code': 'invalid-mcp-config', 'error': 'MCP collection must be a mapping; values omitted'})
         return rows
     for name, value in mapping.items():
         if not isinstance(value, dict):
-            errors.append({'source': source, 'name': name, 'error': 'MCP entry must be a mapping; values omitted'})
+            errors.append({'source': source, 'name': name, 'code': 'invalid-mcp-config', 'error': 'MCP entry must be a mapping; values omitted'})
             continue
         maps = ('env', 'headers', 'http_headers', 'env_http_headers')
         lists = ('args', 'env_vars')
@@ -177,14 +232,21 @@ def mcp_rows(mapping, source, errors=None):
         valid = valid and ('enabled' not in value or isinstance(value['enabled'], bool))
         valid = valid and all(key not in value or isinstance(value[key], str) for key in ('command', 'url', 'cwd'))
         if not valid:
-            errors.append({'source': source, 'name': name, 'error': 'Invalid MCP field types; values omitted'})
+            errors.append({'source': source, 'name': name, 'code': 'invalid-mcp-config', 'error': 'Invalid MCP field types; values omitted'})
+            continue
+        if portable and value.get('type') not in ('stdio', 'streamable-http', 'sse'):
+            errors.append({'source': source, 'name': name, 'code': 'invalid-transport',
+                           'error': 'Missing or unsupported portable MCP transport; values omitted'})
             continue
         command = value.get('command')
         command_exists = None
         if isinstance(command, str) and Path(command).is_absolute():
-            command_exists = Path(command).is_file()
+            try:
+                command_exists = Path(command).is_file()
+            except OSError as error:
+                errors.append({'source': source, 'name': name, **error_info(error)})
         rows.append({'name': name, 'source': source, 'enabled': value.get('enabled', 'unspecified'),
-                     'transport': 'url' if value.get('url') else 'stdio', 'absolute_command_exists': command_exists,
+                     'transport': value['type'] if portable else ('url' if value.get('url') else 'stdio'), 'absolute_command_exists': command_exists,
                      'argument_count': len(value.get('args', [])),
                      'env_keys': sorted(set(value.get('env', {})) | set(value.get('env_vars', []))),
                      'header_keys': sorted(set(value.get('headers', {})) | set(value.get('http_headers', {})) |
@@ -193,95 +255,214 @@ def mcp_rows(mapping, source, errors=None):
     return rows
 
 
-def inventory(home):
+PORTABLE_PLUGIN_SCHEMA = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'
+
+
+def package_path(root, value):
+    # Check text before normalizing, including Windows drive and backslash escapes.
+    if (not isinstance(value, str) or not value.startswith('./') or '\\' in value or
+            ':' in value or any(part in ('', '.', '..') for part in value[2:].removesuffix('/').split('/'))):
+        raise MaintenanceError('Expected a ./ path inside the plugin', 'invalid-component-path')
+    return root / value[2:]
+
+
+def inventory(home, deep=False, owners=('user', 'system', 'plugin'), include_config=True):
     home = absolute(home)
-    report = {'schema': 1, 'created_at': now(), 'codex_home': str(home), 'skills': [], 'plugins': [],
-              'mcp': [], 'aliases': [], 'errors': [], 'scope': 'filesystem and user config; not effective runtime state'}
+    report = {'schema': 2, 'created_at': now(), 'codex_home': str(home), 'skills': [], 'plugins': [],
+              'mcp': [], 'aliases': [], 'errors': [], 'mode': 'deep' if deep else 'metadata',
+              'scope': 'filesystem and user config' if include_config else 'filesystem skills only',
+              'runtime_state_checked': False, 'owners': list(owners)}
+    caught = (MaintenanceError, OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired)
+
+    def failure(path, error):
+        report['errors'].append({'path': str(path), **error_info(error)})
+
+    def alias(path, owner):
+        row = {'path': str(path), 'owner': owner}
+        try:
+            row['target'] = str(path.resolve())
+        except (OSError, RuntimeError) as error:
+            failure(path, error)
+        if row not in report['aliases']:
+            report['aliases'].append(row)
+
+    def available(path, owner):
+        if linked_path(path):
+            alias(path, owner)
+            return False
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def json_mapping(path):
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+        if not isinstance(data, dict):
+            raise MaintenanceError('Expected a JSON object; values omitted', 'invalid-data')
+        return data
+
     config = {}
     cfg = home / 'config.toml'
-    if cfg.exists():
-        try:
+    try:
+        if include_config and available(cfg, 'user-config'):
             config = tomllib.loads(cfg.read_text(encoding='utf-8-sig'))
-        except (OSError, ValueError):
-            report['errors'].append({'path': str(cfg), 'error': 'config parse failed; values omitted'})
-    report['mcp'] += mcp_rows(config.get('mcp_servers', {}), 'user-config', report['errors'])
-    seen = set()
-    def alias(path, owner):
-        report['aliases'].append({'path': str(path), 'target': str(path.resolve()), 'owner': owner})
+    except caught as error:
+        failure(cfg, error)
+    if include_config and 'user' in owners:
+        report['mcp'] += mcp_rows(config.get('mcp_servers', {}), 'user-config', report['errors'])
 
     def directories(folder, owner):
-        if linked_path(folder):
-            alias(folder, owner)
+        try:
+            if not available(folder, owner):
+                return
+            children = sorted(folder.iterdir())
+        except caught as error:
+            failure(folder, error)
             return
-        if folder.is_dir():
-            for path in sorted(folder.iterdir()):
+        for path in children:
+            try:
                 if is_link(path):
                     alias(path, owner)
                 elif path.is_dir():
                     yield path
+            except caught as error:
+                failure(path, error)
 
+    seen = set()
+    pending = []
     def skill(path, owner, plugin_id=None):
-        if is_link(path):
-            alias(path, owner)
-            return
-        if not (path / 'SKILL.md').is_file():
-            return
-        if is_link(path / 'SKILL.md'):
-            alias(path / 'SKILL.md', owner)
-            return
-        real = str(path.resolve())
-        if real in seen:
-            return
-        seen.add(real)
-        row = {'id': instance_id(path), 'path': str(path), 'realpath': real, 'owner': owner, 'plugin_id': plugin_id}
+        row = {'id': instance_id(path), 'path': str(path), 'owner': owner, 'plugin_id': plugin_id,
+               'content_hashed': False}
         try:
-            row.update(skill_metadata(path))
-            tree = snapshot(path)
-            row.update(fingerprint=tree['fingerprint'], file_count=sum(v['type'] == 'file' for v in tree['files'].values()))
-        except (MaintenanceError, OSError, ValueError, subprocess.TimeoutExpired) as error:
-            message = str(error) if isinstance(error, MaintenanceError) else type(error).__name__
-            row.update(error=message)
-            report['errors'].append({'path': str(path), 'error': message})
+            if not available(path / 'SKILL.md', owner):
+                return
+            real = str(path.resolve())
+            if real in seen:
+                return
+            seen.add(real)
+            row['realpath'] = real
+            ui = path / 'agents' / 'openai.yaml'
+            if linked_path(ui):
+                alias(ui, owner)
+                raise MaintenanceError('Linked invocation metadata was not read', 'linked-metadata')
+            pending.append((path, row, skill_documents(path)))
+        except caught as error:
+            row.update(error_info(error))
+            failure(path, error)
         report['skills'].append(row)
+
     for base, owner in [(home / 'skills', 'user'), (home / 'skills' / '.system', 'system')]:
-        for path in directories(base, owner):
-            if not path.name.startswith('.'):
-                skill(path, owner)
-    cache = home / 'plugins' / 'cache'
+        if owner in owners:
+            for path in directories(base, owner):
+                if not path.name.startswith('.'):
+                    skill(path, owner)
+
     def plugin_roots():
-        for market in directories(cache, 'plugin'):
+        for market in directories(home / 'plugins' / 'cache', 'plugin'):
             for package in directories(market, 'plugin'):
                 yield from directories(package, 'plugin')
 
-    def plugin_skills(folder):
+    def plugin_skills(folder, required=False):
+        try:
+            if not available(folder, 'plugin'):
+                if required and not linked_path(folder):
+                    raise MaintenanceError('Declared skill directory is missing', 'component-missing')
+                return
+        except caught as error:
+            failure(folder, error)
+            return
         yield folder
         for child in directories(folder, 'plugin'):
             if not child.name.startswith('.') and child.name not in ('node_modules', '__pycache__'):
                 yield from plugin_skills(child)
 
-    for root in plugin_roots():
-        manifest = root / '.codex-plugin' / 'plugin.json'
-        if linked_path(manifest):
-            alias(manifest, 'plugin')
-            continue
-        if not manifest.is_file():
-            continue
+    def component_paths(root, value):
+        values = value if isinstance(value, list) else [value]
+        paths = []
+        for item in values:
+            try:
+                path = package_path(root, item)
+                if path not in paths:
+                    paths.append(path)
+            except caught as error:
+                # Never include the untrusted value (which may be a URL or secret) in diagnostics.
+                failure(root, error)
+        return paths
+
+    def read_mcp(path, plugin_id, portable, required=False):
+        try:
+            if available(path, 'plugin'):
+                data = json_mapping(path)
+                report['mcp'] += mcp_rows(data.get('mcpServers', {}), plugin_id, report['errors'], portable=portable)
+            elif required and not linked_path(path):
+                raise MaintenanceError('Declared MCP configuration is missing', 'component-missing')
+        except caught as error:
+            failure(path, error)
+
+    for root in plugin_roots() if 'plugin' in owners else ():
+        manifest = root / 'plugin.json'
+        legacy = root / '.codex-plugin' / 'plugin.json'
         plugin_id = root.parent.name + '@' + root.parent.parent.name
         try:
-            data = json.loads(manifest.read_text(encoding='utf-8-sig'))
+            portable = False
+            if available(manifest, 'plugin'):
+                data = json_mapping(manifest)
+                portable = data.get('$schema') == PORTABLE_PLUGIN_SCHEMA
+                if not portable:
+                    failure(manifest, MaintenanceError('Unrecognized portable plugin schema', 'unsupported-plugin-schema'))
+            if not portable:
+                manifest = legacy
+                if not available(manifest, 'plugin'):
+                    continue
+                data = json_mapping(manifest)
+            plugin_settings = config.get('plugins', {})
+            if not isinstance(plugin_settings, dict):
+                raise MaintenanceError('Invalid plugin settings collection; values omitted', 'invalid-data')
+            settings = plugin_settings.get(plugin_id, {})
+            if not isinstance(settings, dict) or ('enabled' in settings and not isinstance(settings['enabled'], bool)):
+                raise MaintenanceError('Invalid plugin settings; values omitted', 'invalid-data')
             report['plugins'].append({'id': plugin_id, 'path': str(root), 'version': data.get('version', root.name),
-                                      'enabled_in_user_config': config.get('plugins', {}).get(plugin_id, {}).get('enabled', 'unspecified'),
+                                      'format': 'portable' if portable else 'legacy',
+                                      'enabled_in_user_config': settings.get('enabled', 'unspecified'),
                                       'managed': True, 'effective_state': 'requires-native-query'})
-            for path in plugin_skills(root):
-                skill(path, 'plugin', plugin_id)
-            mcp = root / '.mcp.json'
-            if is_link(mcp):
-                alias(mcp, 'plugin')
-            elif mcp.is_file():
-                report['mcp'] += mcp_rows(json.loads(mcp.read_text(encoding='utf-8-sig')).get('mcpServers', {}), plugin_id, report['errors'])
-        except (OSError, ValueError, AttributeError):
-            report['errors'].append({'path': str(manifest), 'error': 'plugin parse failed; values omitted'})
+            # Portable components are fixed. Inline extensions and legacy overlays cannot override them.
+            skills = './skills' if portable else data.get('skills', './skills')
+            for folder in component_paths(root, skills):
+                for path in plugin_skills(folder, required=not portable and 'skills' in data):
+                    skill(path, 'plugin', plugin_id)
+            mcp = './mcp.json' if portable else data.get('mcpServers', './.mcp.json')
+            if isinstance(mcp, dict) and not portable:
+                report['mcp'] += mcp_rows(mcp.get('mcpServers', mcp), plugin_id, report['errors'])
+            else:
+                for path in component_paths(root, mcp):
+                    read_mcp(path, plugin_id, portable, required=not portable and 'mcpServers' in data)
+        except caught as error:
+            failure(manifest, error)
+    documents = [text for _, _, texts in pending for text in texts]
+    parsed = []
+    # Bound each parser request; a malformed document remains an individual failure.
+    for start in range(0, len(documents), 128):
+        batch = documents[start:start + 128]
+        try:
+            parsed.extend(parse_yaml_batch(batch))
+        except caught as error:
+            parsed.extend([MaintenanceError(error_info(error)['error'], error_info(error)['code'])] * len(batch))
+    offset = 0
+    for path, row, texts in pending:
+        values = parsed[offset:offset + len(texts)]
+        offset += len(texts)
+        try:
+            row.update(metadata_from_values(values))
+            if deep:
+                tree = snapshot(path)
+                row.update(fingerprint=tree['fingerprint'], content_hashed=True,
+                           file_count=sum(v['type'] == 'file' for v in tree['files'].values()))
+        except caught as error:
+            row.update(error_info(error))
+            failure(path, error)
     report['counts'] = {owner: sum(s['owner'] == owner for s in report['skills']) for owner in ('user', 'system', 'plugin')}
+    report['complete'] = not report['errors'] and not report['aliases']
     return report
 
 
@@ -315,8 +496,18 @@ def github_json(route):
         return json.loads(raw)
     except MaintenanceError:
         raise
+    except HTTPError as error:
+        limited = error.code == 429 or (error.code == 403 and
+                  (error.headers.get('X-RateLimit-Remaining') == '0' or error.headers.get('Retry-After')))
+        code = 'github-rate-limited' if limited else ('upstream-not-found' if error.code == 404 else 'github-http-error')
+        raise MaintenanceError('GitHub request failed (HTTP ' + str(error.code) + ')', code) from None
+    except (TimeoutError, subprocess.TimeoutExpired):
+        raise MaintenanceError('GitHub request timed out', 'network-timeout') from None
+    except URLError as error:
+        code = 'network-timeout' if isinstance(error.reason, TimeoutError) else 'network-error'
+        raise MaintenanceError('GitHub connection failed', code) from None
     except Exception as error:
-        raise MaintenanceError('GitHub read failed: ' + type(error).__name__) from None
+        raise MaintenanceError('GitHub response could not be read: ' + type(error).__name__, 'github-response-error') from None
 
 
 def validate_source(repo, subdir, commit):
@@ -333,17 +524,17 @@ def github_tree(repo, subdir, commit):
     validate_source(repo, subdir, commit)
     data = github_json(f'{repo}/git/trees/{commit}?recursive=1')
     if data.get('truncated') or not isinstance(data.get('tree'), list):
-        raise MaintenanceError('Incomplete GitHub tree; update status unknown')
+        raise MaintenanceError('Incomplete GitHub tree; update status unknown', 'upstream-tree-incomplete')
     prefix = subdir + '/'
     result = {}
     for item in data['tree']:
         if not item['path'].startswith(prefix) or item['type'] == 'tree':
             continue
         if item['type'] != 'blob' or item.get('mode') not in ('100644', '100755'):
-            raise MaintenanceError('Upstream symlinks/submodules require manual inspection')
+            raise MaintenanceError('Upstream symlinks/submodules require manual inspection', 'upstream-special-entry')
         result[item['path'][len(prefix):]] = {'git_sha': item['sha'], 'executable': item['mode'] == '100755'}
     if 'SKILL.md' not in result:
-        raise MaintenanceError('No SKILL.md at the confirmed upstream path')
+        raise MaintenanceError('No SKILL.md at the confirmed upstream path', 'upstream-path-missing')
     return result
 
 
@@ -427,7 +618,10 @@ def open_lock(path):
 
 def registry(home):
     path = absolute(home) / 'maintenance' / 'registry.json'
-    return json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {'schema': 1, 'entries': {}}
+    data = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {'schema': 1, 'entries': {}}
+    if not isinstance(data, dict) or data.get('schema') != 1 or not isinstance(data.get('entries'), dict):
+        raise MaintenanceError('Invalid or unsupported registry structure', 'invalid-registry')
+    return data
 
 
 def register(home, path, repo=None, subdir=None, commit=None, ref='main', note=''):
@@ -459,17 +653,34 @@ def register(home, path, repo=None, subdir=None, commit=None, ref='main', note='
 
 
 def check_updates(home):
-    rows = []
-    for entry in registry(home)['entries'].values():
-        row = {'id': entry['id'], 'path': entry['path'], 'name': entry['name']}
+    # Reconcile against discovery without silently registering or changing any baseline.
+    discovered = inventory(home, owners=('user',), include_config=False)
+    installed = {item['id']: item for item in discovered['skills']}
+    rows, errors = [], list(discovered['errors'])
+    registry_readable = True
+    try:
+        entries = registry(home)['entries']
+    except (MaintenanceError, OSError, ValueError) as error:
+        registry_readable = False
+        entries = {}
+        errors.append({'path': str(absolute(home) / 'maintenance' / 'registry.json'), **error_info(error)})
+    for key, entry in entries.items():
+        row = {'id': key}
         try:
-            snap = snapshot(entry['path'])
+            if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+                raise MaintenanceError('Invalid registry entry', 'invalid-registry-entry')
+            row.update(path=entry['path'], name=entry.get('name'))
+            path = user_target(home, entry['path'])
+            if key != instance_id(path):
+                raise MaintenanceError('Registry path and instance ID differ', 'invalid-registry-entry')
+            snap = snapshot(path)
             local = git_files(snap)
             row['local_since_registration'] = diff_git_maps(entry['baseline_local'], local)
             row['local_executable_bits_comparable'] = os.name != 'nt'
             row['full_local_fingerprint_changed'] = snap['fingerprint'] != entry['baseline_fingerprint']
             source = entry['source']
             if source:
+                validate_source(source['repo'], source['subdir'], source['commit'])
                 sha = resolve_ref(source['repo'], source['ref'])
                 current = github_tree(source['repo'], source['subdir'], sha)
                 difference = diff_maps(entry['upstream_files'], current)
@@ -477,10 +688,28 @@ def check_updates(home):
                            upstream_changed=any(difference.values()), local_vs_upstream=diff_git_maps(current, local))
             else:
                 row['status'] = 'local-or-unknown-source'
-        except (MaintenanceError, OSError, ValueError) as error:
-            row.update(status='unknown', error=type(error).__name__)
+        except (MaintenanceError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            row.update(status='unknown', **error_info(error))
+        # Bad metadata cannot be mistaken for a fully checked installation.
+        if key in installed and installed[key].get('error'):
+            row.update(status='unknown', code=installed[key]['code'], error=installed[key]['error'])
         rows.append(row)
-    return {'schema': 1, 'checked_at': now(), 'entries': rows, 'writes_performed': False}
+    for key, item in installed.items():
+        if key not in entries:
+            row = {'id': key, 'path': item['path'], 'name': item.get('name'),
+                   'status': 'unregistered' if registry_readable else 'registry-unavailable'}
+            if item.get('error'):
+                row.update(status='unknown', code=item['code'], error=item['error'])
+            rows.append(row)
+    statuses = ('checked', 'unregistered', 'local-or-unknown-source', 'unknown', 'registry-unavailable')
+    summary = {status: sum(row['status'] == status for row in rows) for status in statuses}
+    summary.update(installed_user_skills=len(installed), registered_entries=len(entries),
+                   updates_available=sum(row.get('upstream_changed', False) for row in rows),
+                   discovery_complete=discovered['complete'], registry_readable=registry_readable)
+    return {'schema': 2, 'checked_at': now(), 'entries': rows, 'summary': summary,
+            'errors': errors, 'aliases': discovered['aliases'],
+            'scope': 'direct user skills in CODEX_HOME/skills; linked, system and plugin skills excluded',
+            'writes_performed': False}
 
 
 def no_links(tree):
@@ -593,7 +822,8 @@ def main():
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
     parser.add_argument('--output', type=Path, help='Write JSON here; otherwise print. Do not place output inside a compared skill.')
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('inventory', help='Read-only filesystem inventory; effective runtime state needs native queries')
+    inv = sub.add_parser('inventory', help='Read-only metadata inventory; effective runtime state needs native queries')
+    inv.add_argument('--deep', action='store_true', help='Also hash full skill contents for duplicate/content comparisons')
     sub.add_parser('check-updates', help='Read GitHub metadata for registered sources; never install or change registry')
     reg = sub.add_parser('register', help='Persist verified source or local-only baseline for one user skill')
     reg.add_argument('path', type=Path)
@@ -615,7 +845,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == 'inventory':
-            result = inventory(args.home)
+            result = inventory(args.home, deep=args.deep)
         elif args.command == 'register':
             if not args.repo and (args.subdir or args.commit):
                 raise MaintenanceError('--subdir/--commit require --repo')
@@ -640,7 +870,7 @@ def main():
         return 0
     except Exception as error:
         # Parser/network error payloads can contain credentials. Keep diagnostics deliberately narrow.
-        print(json.dumps({'error': str(error) if isinstance(error, MaintenanceError) else type(error).__name__}), file=sys.stderr)
+        print(json.dumps(error_info(error)), file=sys.stderr)
         return 1
 
 

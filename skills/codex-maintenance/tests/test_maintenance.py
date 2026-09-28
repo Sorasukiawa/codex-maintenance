@@ -298,6 +298,317 @@ class MaintenanceTests(unittest.TestCase):
                 m.apply_plan(self.home, p)
         self.assertIn('old', (self.target / 'SKILL.md').read_text(encoding='utf-8'))
 
+    def plugin(self, name='portable', portable=True, **fields):
+        root = self.home / 'plugins' / 'cache' / 'market' / name / '1.0'
+        root.mkdir(parents=True)
+        data = {'name': name, 'version': '1.0', **fields}
+        manifest = root / 'plugin.json'
+        if portable:
+            data['$schema'] = m.PORTABLE_PLUGIN_SCHEMA
+        else:
+            manifest = root / '.codex-plugin' / 'plugin.json'
+            manifest.parent.mkdir()
+        manifest.write_text(json.dumps(data), encoding='utf-8')
+        return root
+
+    def test_portable_components_ignore_legacy_and_inline_overrides(self):
+        root = self.plugin(extensions={'com.openai': {'skills': './ignored', 'mcpServers': './ignored.json'}})
+        self.skill(root / 'skills' / 'actual', 'yes', name='actual')
+        self.skill(root / 'ignored' / 'wrong', 'no', name='wrong')
+        (root / 'mcp.json').write_text(json.dumps({'mcpServers': {
+            'actual': {'type': 'streamable-http', 'url': 'https://SECRET.example/mcp', 'headers': {'TOKEN': 'SECRET'}}}}))
+        (root / '.codex-plugin').mkdir()
+        (root / '.codex-plugin' / 'plugin.json').write_text(json.dumps({'skills': './ignored'}))
+        (root / '.mcp.json').write_text(json.dumps({'mcpServers': {'wrong': {'command': 'SECRET'}}}))
+        data = m.inventory(self.home)
+        self.assertEqual([x['name'] for x in data['skills'] if x['owner'] == 'plugin'], ['actual'])
+        self.assertEqual([x['name'] for x in data['mcp']], ['actual'])
+        self.assertEqual(data['mcp'][0]['transport'], 'streamable-http')
+        self.assertEqual(len(data['plugins']), 1)
+        self.assertEqual(data['plugins'][0]['format'], 'portable')
+        self.assertFalse(data['errors'])
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_legacy_declared_component_paths_and_inline_mcp(self):
+        root = self.plugin('legacy', portable=False, skills=['./workflows/', './extra'],
+                           mcpServers=['./server.json', './second.json'])
+        self.skill(root / 'workflows' / 'one', 'yes', name='one')
+        self.skill(root / 'extra', 'yes', name='two')
+        self.skill(root / 'examples' / 'ignored', 'no')
+        for filename, name in [('server.json', 'one'), ('second.json', 'two')]:
+            (root / filename).write_text(json.dumps({'mcpServers': {name: {'command': 'echo'}}}))
+        other = self.plugin('inline', portable=False, mcpServers={'inline': {'command': 'echo'}})
+        data = m.inventory(self.home)
+        self.assertEqual({x['name'] for x in data['skills'] if x['owner'] == 'plugin'}, {'one', 'two'})
+        self.assertEqual({x['name'] for x in data['mcp']}, {'one', 'two', 'inline'})
+        self.assertFalse(data['errors'])
+
+    def test_invalid_component_path_does_not_escape_or_leak(self):
+        root = self.plugin(portable=False, skills=['./../SECRET', './good'], mcpServers='https://SECRET.example')
+        self.skill(root / 'good', 'yes', name='good')
+        data = m.inventory(self.home)
+        self.assertEqual(data['counts']['plugin'], 1)
+        self.assertEqual(len(data['errors']), 2)
+        self.assertFalse(data['complete'])
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_unknown_portable_schema_is_reported(self):
+        root = self.plugin()
+        (root / 'plugin.json').write_text('{"$schema":"SECRET-unknown-version"}')
+        data = m.inventory(self.home)
+        self.assertEqual(data['plugins'], [])
+        self.assertEqual(data['errors'][0]['code'], 'unsupported-plugin-schema')
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_metadata_inventory_skips_hashing_deep_detects_content(self):
+        with patch.object(m, 'snapshot', side_effect=AssertionError('should not hash')):
+            data = m.inventory(self.home)
+        self.assertFalse(data['skills'][0]['content_hashed'])
+        self.assertNotIn('fingerprint', data['skills'][0])
+        before = m.inventory(self.home, deep=True)['skills'][0]['fingerprint']
+        (self.target / 'helper').write_text('changed')
+        after = m.inventory(self.home, deep=True)['skills'][0]
+        self.assertTrue(after['content_hashed'])
+        self.assertNotEqual(before, after['fingerprint'])
+
+    def test_unreadable_plugin_subtree_preserves_other_results(self):
+        root = self.plugin('broken')
+        self.skill(root / 'skills' / 'bad', 'x')
+        good = self.plugin('good')
+        self.skill(good / 'skills' / 'good', 'x', name='good')
+        original = Path.iterdir
+        def denied(path):
+            if path == root / 'skills':
+                raise PermissionError('SECRET error payload')
+            return original(path)
+        with patch.object(Path, 'iterdir', denied):
+            data = m.inventory(self.home)
+        self.assertEqual(data['counts']['user'], 1)
+        self.assertEqual(data['counts']['plugin'], 1)
+        self.assertEqual(len(data['plugins']), 2)
+        self.assertEqual(data['errors'][0]['code'], 'permission-denied')
+        self.assertFalse(data['complete'])
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_deep_hash_failure_is_isolated(self):
+        other = self.skill(self.home / 'skills' / 'other', 'x', name='other')
+        original = m.snapshot
+        def denied(path):
+            if path == self.target:
+                raise PermissionError('SECRET')
+            return original(path)
+        with patch.object(m, 'snapshot', side_effect=denied):
+            data = m.inventory(self.home, deep=True)
+        self.assertEqual(data['counts']['user'], 2)
+        self.assertTrue(next(row for row in data['skills'] if row['path'] == str(other))['content_hashed'])
+        self.assertFalse(data['complete'])
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_bad_mcp_file_keeps_skills_and_other_plugins(self):
+        root = self.plugin('bad')
+        self.skill(root / 'skills' / 'kept', 'x')
+        (root / 'mcp.json').write_text('{SECRET-invalid-json')
+        self.plugin('good')
+        data = m.inventory(self.home)
+        self.assertEqual(len(data['plugins']), 2)
+        self.assertEqual(data['counts']['plugin'], 1)
+        self.assertEqual(data['errors'][0]['code'], 'invalid-data')
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_unregistered_skills_are_in_update_coverage_without_writes(self):
+        data = m.check_updates(self.home)
+        self.assertEqual(data['entries'][0]['status'], 'unregistered')
+        self.assertEqual(data['summary']['installed_user_skills'], 1)
+        self.assertEqual(data['summary']['checked'], 0)
+        self.assertEqual(data['summary']['unregistered'], 1)
+        self.assertFalse((self.home / 'maintenance').exists())
+
+    def test_update_coverage_distinguishes_registered_local_and_missing(self):
+        m.register(self.home, self.target)
+        other = self.skill(self.home / 'skills' / 'other', 'x', name='other')
+        m.register(self.home, other)
+        other.rename(self.root / 'retained')
+        data = m.check_updates(self.home)
+        self.assertEqual(data['summary']['registered_entries'], 2)
+        self.assertEqual(data['summary']['local-or-unknown-source'], 1)
+        self.assertEqual(data['summary']['unknown'], 1)
+        self.assertEqual(next(row for row in data['entries'] if row['status'] == 'unknown')['code'], 'path-missing')
+
+    def test_corrupt_registry_does_not_claim_unregistered_or_up_to_date(self):
+        folder = self.home / 'maintenance'
+        folder.mkdir()
+        path = folder / 'registry.json'
+        path.write_text('{SECRET')
+        data = m.check_updates(self.home)
+        self.assertFalse(data['summary']['registry_readable'])
+        self.assertEqual(data['entries'][0]['status'], 'registry-unavailable')
+        self.assertEqual(path.read_text(), '{SECRET')
+        self.assertNotIn('SECRET', json.dumps(data))
+
+    def test_malformed_registry_entry_does_not_hide_good_entries(self):
+        m.register(self.home, self.target)
+        path = self.home / 'maintenance' / 'registry.json'
+        data = json.loads(path.read_text())
+        data['entries']['broken'] = 42
+        path.write_text(json.dumps(data))
+        result = m.check_updates(self.home)
+        self.assertEqual(result['summary']['local-or-unknown-source'], 1)
+        self.assertEqual(result['summary']['unknown'], 1)
+
+    def test_update_error_preserves_safe_reason_code(self):
+        upstream = {'SKILL.md': {'git_sha': '0' * 40, 'executable': False}}
+        with patch.object(m, 'github_tree', return_value=upstream):
+            m.register(self.home, self.target, 'owner/repo', 'skills/demo', 'a' * 40)
+        with patch.object(m, 'resolve_ref', side_effect=m.MaintenanceError('GitHub request timed out', 'network-timeout')):
+            data = m.check_updates(self.home)
+        self.assertEqual(data['entries'][0]['code'], 'network-timeout')
+        self.assertEqual(data['summary']['unknown'], 1)
+        self.assertIn('timed out', data['entries'][0]['error'])
+
+    def test_github_http_and_network_errors_are_classified_and_redacted(self):
+        from urllib.error import HTTPError, URLError
+        cases = [(HTTPError('https://SECRET', 429, 'SECRET', {}, None), 'github-rate-limited'),
+                 (HTTPError('https://SECRET', 403, 'SECRET', {'X-RateLimit-Remaining': '0'}, None), 'github-rate-limited'),
+                 (HTTPError('https://SECRET', 404, 'SECRET', {}, None), 'upstream-not-found'),
+                 (HTTPError('https://SECRET', 500, 'SECRET', {}, None), 'github-http-error'),
+                 (URLError('SECRET'), 'network-error'), (TimeoutError('SECRET'), 'network-timeout')]
+        for error, code in cases:
+            with self.subTest(code=code):
+                m.github_json.cache_clear()
+                with patch.object(m, 'urlopen', side_effect=error):
+                    with self.assertRaises(m.MaintenanceError) as raised:
+                        m.github_json('owner/repo/commits/main')
+                self.assertEqual(raised.exception.code, code)
+                self.assertNotIn('SECRET', str(raised.exception))
+
+    def test_upstream_path_missing_and_truncated_have_different_codes(self):
+        for payload, code in [({'tree': []}, 'upstream-path-missing'),
+                              ({'tree': [], 'truncated': True}, 'upstream-tree-incomplete')]:
+            with patch.object(m, 'github_json', return_value=payload):
+                with self.assertRaises(m.MaintenanceError) as raised:
+                    m.github_tree('owner/repo', 'skills/demo', 'a' * 40)
+            self.assertEqual(raised.exception.code, code)
+
+    def test_update_discovery_failure_is_visible_with_partial_results(self):
+        m.register(self.home, self.target)
+        original = Path.iterdir
+        def denied(path):
+            if path == self.home / 'skills':
+                raise PermissionError('SECRET')
+            return original(path)
+        with patch.object(Path, 'iterdir', denied):
+            data = m.check_updates(self.home)
+        self.assertFalse(data['summary']['discovery_complete'])
+        self.assertEqual(data['summary']['local-or-unknown-source'], 1)
+        self.assertEqual(data['errors'][0]['code'], 'permission-denied')
+
+    def test_linked_components_are_not_read(self):
+        root = self.plugin()
+        outside = self.skill(self.root / 'outside', 'SECRET', name='outside')
+        self.directory_link(root / 'skills', outside)
+        data = m.inventory(self.home)
+        self.assertEqual(data['counts']['plugin'], 0)
+        self.assertTrue(data['aliases'])
+        self.assertFalse(data['complete'])
+
+    def test_cli_metadata_and_deep_modes(self):
+        for flags, hashed in [([], False), (['--deep'], True)]:
+            run = subprocess.run([sys.executable, '-B', str(SCRIPT), '--home', str(self.home), 'inventory', *flags],
+                                 capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(run.stdout)['skills'][0]['content_hashed'], hashed)
+
+
+    def test_explicit_missing_components_are_incomplete(self):
+        self.plugin(portable=False, skills='./absent', mcpServers='./absent.json')
+        data = m.inventory(self.home)
+        self.assertEqual(len(data['plugins']), 1)
+        self.assertEqual([row['code'] for row in data['errors']], ['component-missing', 'component-missing'])
+        self.assertFalse(data['complete'])
+
+    def test_update_discovery_ignores_unrelated_mcp_config(self):
+        (self.home / 'config.toml').write_text('invalid SECRET config')
+        data = m.check_updates(self.home)
+        self.assertTrue(data['summary']['discovery_complete'])
+        self.assertFalse(data['errors'])
+        self.assertEqual(data['summary']['unregistered'], 1)
+
+    def test_inaccessible_mcp_command_preserves_other_rows(self):
+        errors = []
+        with patch.object(Path, 'is_file', side_effect=PermissionError('SECRET')):
+            rows = m.mcp_rows({'bad': {'command': sys.executable}, 'good': {'command': 'relative'}}, 'test', errors)
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(rows[0]['absolute_command_exists'])
+        self.assertEqual(errors[0]['code'], 'permission-denied')
+        self.assertNotIn('SECRET', json.dumps(errors))
+
+    @unittest.skipUnless(m.shutil.which('ruby'), 'Existing Ruby Psych runtime')
+    def test_batch_yaml_keeps_valid_documents_next_to_invalid_yaml(self):
+        with patch.dict(sys.modules, {'yaml': None}):
+            values = m.parse_yaml_batch(['name: one', 'invalid: [SECRET', 'policy:\n  allow_implicit_invocation: false'])
+        self.assertEqual(values[0], {'name': 'one'})
+        self.assertIsInstance(values[1], m.MaintenanceError)
+        self.assertNotIn('SECRET', str(values[1]))
+        self.assertFalse(values[2]['policy']['allow_implicit_invocation'])
+
+    def test_batched_inventory_preserves_valid_skills_and_policy(self):
+        other = self.skill(self.home / 'skills' / 'other', 'good', name='other')
+        (other / 'agents').mkdir()
+        (other / 'agents' / 'openai.yaml').write_text('policy:\n  allow_implicit_invocation: false\n')
+        (self.target / 'SKILL.md').write_text('---\nname: [SECRET\ndescription: test\n---\n')
+        result = m.inventory(self.home, deep=True)
+        good = next(row for row in result['skills'] if row.get('name') == 'other')
+        self.assertFalse(good['implicit_invocation'])
+        self.assertTrue(good['content_hashed'])
+        bad = next(row for row in result['skills'] if row['path'] == str(self.target))
+        self.assertEqual(bad['code'], 'invalid-yaml')
+        self.assertFalse(bad['content_hashed'])
+        self.assertNotIn('SECRET', json.dumps(result))
+
+    @unittest.skipUnless(m.shutil.which('ruby'), 'Existing Ruby Psych runtime')
+    def test_large_inventory_batches_keep_all_metadata(self):
+        for index in range(70):
+            skill = self.skill(self.home / 'skills' / f'demo-{index}', 'body', name=f'demo-{index}')
+            (skill / 'agents').mkdir()
+            (skill / 'agents' / 'openai.yaml').write_text('policy:\n  allow_implicit_invocation: false\n')
+        original = m.subprocess.run
+        with patch.dict(sys.modules, {'yaml': None}), patch.object(m.subprocess, 'run', wraps=original) as runner:
+            result = m.inventory(self.home)
+        self.assertEqual(result['counts']['user'], 71)
+        self.assertFalse(result['errors'])
+        self.assertEqual(sum(row['implicit_invocation'] is False for row in result['skills']), 70)
+        self.assertLessEqual(runner.call_count, 2)
+
+    def test_missing_yaml_parser_returns_partial_report(self):
+        with patch.dict(sys.modules, {'yaml': None}), patch.object(m.shutil, 'which', return_value=None):
+            result = m.inventory(self.home)
+        self.assertEqual(result['counts']['user'], 1)
+        self.assertEqual(result['skills'][0]['code'], 'yaml-parser-unavailable')
+        self.assertFalse(result['complete'])
+
+    def test_inventory_rereads_changed_invocation_metadata(self):
+        (self.target / 'agents').mkdir()
+        path = self.target / 'agents' / 'openai.yaml'
+        path.write_text('policy:\n  allow_implicit_invocation: true\n')
+        self.assertTrue(m.inventory(self.home)['skills'][0]['implicit_invocation'])
+        path.write_text('policy:\n  allow_implicit_invocation: false\n')
+        self.assertFalse(m.inventory(self.home)['skills'][0]['implicit_invocation'])
+
+    def test_parser_timeout_is_reported_without_payload(self):
+        with patch.object(m, 'parse_yaml_batch', side_effect=subprocess.TimeoutExpired('SECRET', 20, output='SECRET')):
+            result = m.inventory(self.home)
+        self.assertEqual(result['skills'][0]['code'], 'timeout')
+        self.assertFalse(result['complete'])
+        self.assertNotIn('SECRET', json.dumps(result))
+
+
+    @unittest.skipUnless(m.shutil.which('ruby'), 'Existing Ruby Psych runtime')
+    def test_non_utf8_yaml_binary_does_not_fail_other_documents(self):
+        with patch.dict(sys.modules, {'yaml': None}):
+            values = m.parse_yaml_batch(['name: good', 'name: !!binary //8=', 'name: other'])
+        self.assertEqual(values[0], {'name': 'good'})
+        self.assertIsInstance(values[1], m.MaintenanceError)
+        self.assertEqual(values[2], {'name': 'other'})
+
 
 if __name__ == '__main__':
     unittest.main()
