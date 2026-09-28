@@ -60,6 +60,8 @@ From the repository root:
 ```sh
 python3 -B skills/codex-maintenance/scripts/maintenance.py --help
 python3 -B skills/codex-maintenance/scripts/maintenance.py inventory
+# Include full content hashes when needed:
+python3 -B skills/codex-maintenance/scripts/maintenance.py inventory --deep
 python3 -B skills/codex-maintenance/scripts/maintenance.py check-updates
 ```
 
@@ -75,13 +77,19 @@ py -3 -B $tool --home $codexRoot check-updates
 
 If neither YAML parser is available, choose an existing interpreter with one installed. To set up PyYAML explicitly in the selected Windows interpreter, run `py -3 -m pip install 'PyYAML>=6,<7'`. This is an optional manual setup step, not performed by the skill. UTF-8 files (including BOM/CRLF) and Unicode paths are supported. JSON files use UTF-8; console JSON escapes Unicode for legacy code pages.
 
-`inventory` is read-only. `register` persists a verified source or local baseline. `check-updates` reads public GitHub metadata without installing anything. `compare` and `plan` describe a complete staged candidate. `apply` replaces a reviewed user skill while retaining a backup; `rollback` refuses to overwrite subsequent edits. Plans are not a substitute for user authorization.
+`inventory` is read-only and defaults to metadata inspection. Add `--deep` for full content hashes. YAML documents are parsed in bounded batches, reducing Ruby process startup overhead while isolating invalid documents; file contents and invocation policies are reread on each run.
+
+`register` persists a verified source or local baseline. `check-updates` reconciles installed user skills with the registry and reads public GitHub metadata for confirmed sources without installing anything. Unregistered skills, unknown sources, failed checks, and an unreadable registry remain explicit in its coverage summary; zero updates does not mean all skills are current.
+
+`compare` and `plan` describe a complete staged candidate. `apply` replaces a reviewed user skill while retaining a backup; `rollback` refuses to overwrite subsequent edits. Plans are not a substitute for user authorization.
+
+Inventory and update reports use `schema=2`; registries, plans, and receipts remain at schema 1. Consumers that need inventory fingerprints must request `inventory --deep`. Read failures retain partial results and sanitized reason codes.
 
 Pass global options `--home` and `--output` before the subcommand. State and backups live in `CODEX_HOME/maintenance`, outside the distributed skill. See the [command and recovery reference](skills/codex-maintenance/references/automation.md).
 
 ## Boundaries
 
-The filesystem inventory covers `CODEX_HOME/skills`, `.system`, standard plugin caches, and user `config.toml`. Other discovery roots such as `~/.agents/skills`, project configuration, and nonstandard layouts need supplementary inspection. Cache entries do not establish effective enablement or a successful MCP handshake.
+The filesystem inventory covers `CODEX_HOME/skills`, `.system`, standard plugin caches, and user `config.toml`. Other discovery roots such as `~/.agents/skills`, project configuration, and nonstandard layouts need supplementary inspection. Portable plugins use root `plugin.json`, `skills/`, and `mcp.json`; legacy plugins use `.codex-plugin/plugin.json` and its declared component paths. Coexisting manifests do not duplicate components, and missing explicitly declared paths are reported. Cache entries do not establish effective enablement or a successful MCP handshake.
 
 Automatic replacement supports only real direct children of `CODEX_HOME/skills`. Managed directories and packages containing symlinks, junctions, or other reparse points are excluded. Windows support targets ordinary local directories; OneDrive placeholders and network shares are not validated update targets. Windows cannot reliably compare POSIX executable bits or ACLs: local executable bits are reported as unknown and excluded from local/upstream comparisons. Upstream-to-upstream mode changes remain visible. There is no automatic semantic merge, candidate download, plugin uninstall, or general cache deletion. Unknown sources and network failures remain unknown.
 
