@@ -40,11 +40,13 @@ python3 -B "$tool" --output work/updates.json check-updates
 python3 -B "$tool" register "$installed" --repo owner/repository \
   --subdir skills/example --commit "$verified_commit" --ref main \
   --note '保留本地定制的行为和调用策略'
+# 若已核实该用户 skill 已卸载，归档并从台账移除：
+python3 -B "$tool" unregister "$installed_or_id" --note '用户已卸载'
 ```
 
-本地自编或来源尚未确认时省略仓库参数，用 `--note` 说明证据。重复登记会在 `registry-history` 保存前一条记录，再更新基线，不会安装或更新 skill。
+仓库根目录直接存放 `SKILL.md` 时，`--subdir` 可设为 `.` 或省略。本地自编或来源尚未确认时省略仓库参数，用 `--note` 说明证据。重复登记或 `unregister` 会在 `registry-history` 保存前一条记录，不会安装或删除实际 skill 目录。
 
-`check-updates` 先发现用户 skill 并与台账对账，保留台账中安装已消失的条目。仅对来源已登记的条目联网：解析跟踪分支，再按固定 SHA 查询完整 GitHub 树。支持公开 GitHub 仓库，不管理凭据；其他来源按核实流程补查。不自动登记来源或更新基线。
+`check-updates` 先发现用户 skill 并与台账对账，保留台账中安装已消失的条目。仅对来源已登记的条目联网：解析跟踪分支，再按固定 SHA 查询 GitHub 树（整库递归树被截断时自动按路径解析子目录树）。支持公开 GitHub 仓库，不管理凭据；其他来源按核实流程补查。不自动登记来源或更新基线。
 
 盘点及更新报告使用 `schema=2`；台账、计划和回执仍为 schema 1。更新报告中的 `summary` 汇总以下状态，另有 `installed_user_skills`、`registered_entries`、`updates_available`、`discovery_complete` 和 `registry_readable`：
 
@@ -71,7 +73,8 @@ python3 -B "$tool" --output work/diff.json compare "$installed" "$candidate"
 python3 -B "$tool" --output work/plan.json plan "$installed" "$candidate"
 # 在当前用户授权内执行已审阅的具体计划：
 python3 -B "$tool" --output work/receipt.json apply work/plan.json
-# 需要恢复时，使用回执中的 id：
+# 只读查看已有备份与回执状态，或按回执中的 id 恢复：
+python3 -B "$tool" backups
 python3 -B "$tool" rollback "$operation_id"
 ```
 
