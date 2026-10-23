@@ -31,6 +31,50 @@ class MaintenanceTests(unittest.TestCase):
     def plan(self):
         return m.make_plan(self.home, self.target, self.candidate)
 
+    def test_link_audit_reads_external_skill_without_registry_writes(self):
+        external = self.skill(self.root / 'claude' / 'shared', 'external', name='shared')
+        self.directory_link(self.home / 'skills' / 'shared', external)
+        before = m.snapshot(external)
+        result = m.audit_links(self.home)
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['entries'][0]['target'], str(external))
+        self.assertEqual(result['entries'][0]['name'], 'shared')
+        self.assertEqual(m.snapshot(external), before)
+        self.assertFalse((self.home / 'maintenance').exists())
+        self.assertNotIn('fingerprint', result['entries'][0])
+        with self.assertRaises(m.MaintenanceError):
+            m.make_plan(self.home, self.home / 'skills' / 'shared', self.candidate)
+
+    @unittest.skipIf(os.name == 'nt', 'symbolic link permission differs on Windows')
+    def test_link_audit_reports_broken_and_cyclic_links_without_crashing(self):
+        (self.home / 'skills' / 'broken').symlink_to(self.root / 'missing')
+        (self.home / 'skills' / 'cycle').symlink_to('cycle')
+        result = m.audit_links(self.home)
+        self.assertFalse(result['complete'])
+        self.assertEqual(len(result['errors']), 2)
+
+    def test_link_audit_deduplicates_target_identity_and_supports_deep_mode(self):
+        self.directory_link(self.home / 'skills' / 'first', self.target)
+        self.directory_link(self.home / 'skills' / 'second', self.target)
+        result = m.audit_links(self.home, deep=True)
+        self.assertEqual(result['unique_targets'], 1)
+        self.assertEqual(len(result['entries']), 2)
+        self.assertEqual(result['entries'][0]['fingerprint'], result['entries'][1]['fingerprint'])
+
+    @unittest.skipIf(os.name == 'nt', 'symbolic link permission differs on Windows')
+    def test_link_audit_does_not_follow_nested_metadata_or_linked_root(self):
+        external = self.skill(self.root / 'external', 'external')
+        (external / 'SKILL.md').unlink()
+        (external / 'SKILL.md').symlink_to(self.target / 'SKILL.md')
+        self.directory_link(self.home / 'skills' / 'nested', external)
+        result = m.audit_links(self.home)
+        self.assertEqual(result['entries'][0]['code'], 'linked-metadata')
+        other_home = self.root / 'other-home'
+        other_home.mkdir()
+        (other_home / 'skills').symlink_to(self.home / 'skills')
+        result = m.audit_links(other_home)
+        self.assertEqual(result['errors'][0]['code'], 'linked-skill-root')
+
     def directory_link(self, link, destination):
         if os.name == 'nt':
             subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(destination)], check=True, capture_output=True)
