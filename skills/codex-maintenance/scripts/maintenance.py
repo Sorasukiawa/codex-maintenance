@@ -466,6 +466,45 @@ def inventory(home, deep=False, owners=('user', 'system', 'plugin'), include_con
     return report
 
 
+def audit_links(home, deep=False):
+    """Inspect explicitly linked user skills without extending write authority."""
+    home = absolute(home)
+    folder = home / 'skills'
+    report = {'schema': 1, 'created_at': now(), 'codex_home': str(home),
+              'entries': [], 'errors': [], 'writes_performed': False,
+              'scope': 'explicit links directly under CODEX_HOME/skills',
+              'mode': 'deep' if deep else 'metadata'}
+    caught = (MaintenanceError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired)
+    if linked_path(folder):
+        report['errors'].append({'path': str(folder), 'code': 'linked-skill-root',
+                                 'error': 'Skill root must be a real directory'})
+    elif folder.exists():
+        for path in sorted(folder.iterdir()):
+            if not is_link(path):
+                continue
+            row = {'path': str(path)}
+            try:
+                target = path.resolve(strict=True)
+                row['target'] = str(target)
+                if not target.is_dir():
+                    raise MaintenanceError('Linked target must be a skill directory', 'invalid-link-target')
+                for document in (target / 'SKILL.md', target / 'agents' / 'openai.yaml'):
+                    if document.exists() and any(is_link(p) for p in (document, *document.parents)
+                                                 if p == target or target in p.parents):
+                        raise MaintenanceError('Linked metadata needs separate inspection', 'linked-metadata')
+                row.update(status='checked', target_id=instance_id(target), **skill_metadata(target))
+                if deep:
+                    tree = snapshot(target)
+                    row.update(fingerprint=tree['fingerprint'], file_count=len(tree['files']))
+            except caught as error:
+                row.update(status='unknown', **error_info(error))
+                report['errors'].append({'path': str(path), **error_info(error)})
+            report['entries'].append(row)
+    report['complete'] = not report['errors']
+    report['unique_targets'] = len({r['target_id'] for r in report['entries'] if 'target_id' in r})
+    return report
+
+
 def git_files(tree):
     # Generated Python caches are excluded from upstream comparison only, never backups/drift checks.
     return {p: {'git_sha': v['git_sha'], 'executable': None if os.name == 'nt' else bool(v['mode'] & 0o111)}
@@ -824,6 +863,8 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     inv = sub.add_parser('inventory', help='Read-only metadata inventory; effective runtime state needs native queries')
     inv.add_argument('--deep', action='store_true', help='Also hash full skill contents for duplicate/content comparisons')
+    links = sub.add_parser('audit-links', help='Read-only inspection of explicit linked user skills; no registry or install writes')
+    links.add_argument('--deep', action='store_true', help='Also fingerprint resolved targets without traversing nested links')
     sub.add_parser('check-updates', help='Read GitHub metadata for registered sources; never install or change registry')
     reg = sub.add_parser('register', help='Persist verified source or local-only baseline for one user skill')
     reg.add_argument('path', type=Path)
@@ -846,6 +887,8 @@ def main():
     try:
         if args.command == 'inventory':
             result = inventory(args.home, deep=args.deep)
+        elif args.command == 'audit-links':
+            result = audit_links(args.home, deep=args.deep)
         elif args.command == 'register':
             if not args.repo and (args.subdir or args.commit):
                 raise MaintenanceError('--subdir/--commit require --repo')

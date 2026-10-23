@@ -13,7 +13,7 @@ description: Use when the user asks to audit, update, deduplicate, organize, or 
 
 | 任务 | 操作与参考 |
 | --- | --- |
-| 盘点 | 定位实际 `CODEX_HOME`，运行 `inventory`；原生状态查询见[核对参考](references/checks.md#原生查询与文件检查) |
+| 盘点 | 定位实际 `CODEX_HOME`，运行 `inventory`；显式链接目标用 `audit-links` 补查；原生状态查询见[核对参考](references/checks.md#原生查询与文件检查) |
 | 检查更新 | `check-updates` 对账用户安装与来源台账；状态含义和命令见[脚本使用](references/automation.md#来源台账) |
 | 比较、更新独立 skill | 准备候选，`compare` → `plan` → 在既有授权内 `apply`；备份与恢复见[操作说明](references/automation.md#预览备份与回滚) |
 | 清理残留、重复 | 核对替代能力和精确路径清单，按[清理证据](references/checks.md#清理证据)执行 |
