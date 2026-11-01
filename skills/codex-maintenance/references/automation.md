@@ -9,6 +9,8 @@
 ```sh
 python3 -B "$tool" --help
 python3 -B "$tool" --output work/inventory.json inventory
+# 显式链接的用户技能另做只读检查，不扩大替换或登记权限：
+python3 -B "$tool" --output work/linked-skills.json audit-links
 # 仅在需要完整内容哈希时：
 python3 -B "$tool" --output work/inventory-deep.json inventory --deep
 python3 -B "$tool" --output work/updates.json check-updates
@@ -24,7 +26,9 @@ python3 -B "$tool" --output work/updates.json check-updates
 - Legacy：读取 `.codex-plugin/plugin.json`，支持 `skills`、`mcpServers` 的包内路径或路径列表，以及内联 MCP 映射；缺省分别为 `./skills`、`./.mcp.json`。不扫描未声明的示例目录；显式声明的文件或目录缺失会记录 `component-missing`。未知 schema 和不支持的声明保留错误，不当作没有组件。
 - 同名条目保留来源，版本链接列为 alias。配置未声明启停时为 `unspecified`，不能据此声称启用。Portable MCP 保留其声明的 transport 类型。
 
-这是文件系统盘点，不是 Codex 有效配置解析器。原生列表、远程导入的组件、`~/.agents/skills`、项目级入口和其他客户端需要按范围补查。链接只记录目标，不沿链接递归；`complete` 仅表示本次选定文件系统范围没有错误和跳过的链接，不代表全机器或运行态完整。
+这是文件系统盘点，不是 Codex 有效配置解析器。原生列表、远程导入的组件、`~/.agents/skills`、项目级入口和其他客户端需要按范围补查。inventory 中链接只记录目标，不沿链接递归；`complete` 仅表示本次选定文件系统范围没有错误和跳过的链接，不代表全机器或运行态完整。
+
+`audit-links` 单独读取 `CODEX_HOME/skills` 直接子级链接的实际目标，检查技能元数据、损坏/循环链接，并用目标 ID 标明同源入口。默认不哈希内容；`--deep` 可生成目标指纹，仍不递归进入包内链接。链接的元数据文件不继续跟随。命令不写台账、不更新技能；register、plan、apply 对链接的拒绝保持不变。该结果只补充链接目标覆盖，不代表上游更新或运行态已验证。
 
 单个目录、元数据或 MCP 文件失败会记录 `errors` 并继续其他对象。`errors` 非空或 `aliases` 非空时，`complete=false`；不得据此把漏查对象认定为缺失。已有 YAML 解析器不可用时保留错误，不用正则冒充验证。
 
