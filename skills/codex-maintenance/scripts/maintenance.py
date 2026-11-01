@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Codex component inventory and staged user-skill maintenance. Python 3.11+."""
+import sys
+if sys.version_info < (3, 11):
+    sys.stderr.write('{"code": "unsupported-python", "error": "Python 3.11+ is required"}\n')
+    raise SystemExit(1)
+
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -13,7 +18,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import tomllib
 from urllib.parse import quote
@@ -335,7 +339,11 @@ def inventory(home, deep=False, owners=('user', 'system', 'plugin'), include_con
         row = {'id': instance_id(path), 'path': str(path), 'owner': owner, 'plugin_id': plugin_id,
                'content_hashed': False}
         try:
-            if not available(path / 'SKILL.md', owner):
+            manifest = path / 'SKILL.md'
+            if linked_path(manifest):
+                alias(manifest, owner)
+                raise MaintenanceError('Linked skill metadata was not read', 'linked-metadata')
+            if not available(manifest, owner):
                 return
             real = str(path.resolve())
             if real in seen:
@@ -549,22 +557,51 @@ def github_json(route):
         raise MaintenanceError('GitHub response could not be read: ' + type(error).__name__, 'github-response-error') from None
 
 
-def validate_source(repo, subdir, commit):
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo or ''):
+def normalize_subdir(subdir):
+    if subdir is None:
+        return '.'
+    if not isinstance(subdir, str) or not subdir or '\\' in subdir or ':' in subdir or subdir.startswith('/'):
+        return subdir
+    cleaned = subdir.strip('/')
+    while cleaned.startswith('./'):
+        cleaned = cleaned[2:].strip('/')
+    return '.' if cleaned in ('', '.') else cleaned
+
+
+def validate_source(repo, subdir, commit, ref='main'):
+    if (not isinstance(repo, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or
+            any(part in ('.', '..') for part in repo.split('/'))):
         raise MaintenanceError('Expected a GitHub owner/repository')
-    parts = PurePosixPath(subdir or '')
-    if not subdir or parts.is_absolute() or '..' in parts.parts or str(parts) != subdir:
+    parts = PurePosixPath(subdir) if isinstance(subdir, str) else PurePosixPath()
+    if (not isinstance(subdir, str) or not subdir or '\\' in subdir or ':' in subdir or
+            parts.is_absolute() or '..' in parts.parts or (subdir != '.' and str(parts) != subdir)):
         raise MaintenanceError('Expected a repository-relative skill directory')
-    if not re.fullmatch(r'[0-9a-f]{40}', commit or ''):
+    if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise MaintenanceError('A fixed 40-character commit SHA is required')
+    if (not isinstance(ref, str) or not ref.strip() or ref != ref.strip() or
+            any(c.isspace() or ord(c) < 32 for c in ref) or '..' in ref or ref.startswith('/') or ref.endswith('/')):
+        raise MaintenanceError('Expected a valid upstream ref')
 
 
 def github_tree(repo, subdir, commit):
     validate_source(repo, subdir, commit)
     data = github_json(f'{repo}/git/trees/{commit}?recursive=1')
+    prefix = '' if subdir == '.' else subdir + '/'
+    if data.get('truncated') and subdir != '.':
+        # Fall back to resolving the target subdirectory tree when the repository root tree is truncated.
+        sha = commit
+        for part in PurePosixPath(subdir).parts:
+            level = github_json(f'{repo}/git/trees/{sha}')
+            if level.get('truncated') or not isinstance(level.get('tree'), list):
+                raise MaintenanceError('Incomplete GitHub tree; update status unknown', 'upstream-tree-incomplete')
+            entry = next((item for item in level['tree'] if item.get('path') == part), None)
+            if not entry or entry.get('type') != 'tree' or not re.fullmatch(r'[0-9a-f]{40}', entry.get('sha', '')):
+                raise MaintenanceError('No SKILL.md at the confirmed upstream path', 'upstream-path-missing')
+            sha = entry['sha']
+        data = github_json(f'{repo}/git/trees/{sha}?recursive=1')
+        prefix = ''
     if data.get('truncated') or not isinstance(data.get('tree'), list):
         raise MaintenanceError('Incomplete GitHub tree; update status unknown', 'upstream-tree-incomplete')
-    prefix = subdir + '/'
     result = {}
     for item in data['tree']:
         if not item['path'].startswith(prefix) or item['type'] == 'tree':
@@ -668,6 +705,8 @@ def register(home, path, repo=None, subdir=None, commit=None, ref='main', note='
     source = None
     upstream = {}
     if repo:
+        subdir = normalize_subdir(subdir)
+        validate_source(repo, subdir, commit, ref)
         upstream = github_tree(repo, subdir, commit)
         source = {'repo': repo, 'subdir': subdir, 'commit': commit, 'ref': ref}
     metadata = skill_metadata(path)
@@ -689,6 +728,22 @@ def register(home, path, repo=None, subdir=None, commit=None, ref='main', note='
         data['entries'][entry['id']] = entry
         write_json(state / 'registry.json', data)
     return entry
+
+
+def unregister(home, target_or_id, note=''):
+    raw = str(target_or_id)
+    with state_lock(home) as state:
+        data = registry(home)
+        is_id = bool(re.fullmatch(r'[0-9a-f]{20}', raw)) and (raw in data['entries'] or not Path(target_or_id).exists())
+        key = raw if is_id else instance_id(user_target(home, target_or_id))
+        if key not in data['entries']:
+            raise MaintenanceError('Skill is not registered', 'not-registered')
+        previous = data['entries'].pop(key)
+        history = state / 'registry-history' / (uuid.uuid4().hex + '.json')
+        write_json(history, {'archived_at': now(), 'reason': 'unregistered', 'note': note, 'entry': previous})
+        write_json(state / 'registry.json', data)
+    return {'schema': 1, 'unregistered_at': now(), 'id': key, 'path': previous.get('path'),
+            'name': previous.get('name'), 'note': note}
 
 
 def check_updates(home):
@@ -719,7 +774,9 @@ def check_updates(home):
             row['full_local_fingerprint_changed'] = snap['fingerprint'] != entry['baseline_fingerprint']
             source = entry['source']
             if source:
-                validate_source(source['repo'], source['subdir'], source['commit'])
+                if not isinstance(source, dict):
+                    raise MaintenanceError('Invalid registry source', 'invalid-registry-entry')
+                validate_source(source.get('repo'), source.get('subdir'), source.get('commit'), source.get('ref'))
                 sha = resolve_ref(source['repo'], source['ref'])
                 current = github_tree(source['repo'], source['subdir'], sha)
                 difference = diff_maps(entry['upstream_files'], current)
@@ -786,9 +843,14 @@ def require_snapshot(path, expected, identity=True):
 
 
 def apply_plan(home, plan):
+    if not isinstance(plan, dict):
+        raise MaintenanceError('Invalid plan structure', 'invalid-plan')
     unsigned = {k: v for k, v in plan.items() if k != 'plan_hash'}
     if digest(unsigned) != plan.get('plan_hash') or plan.get('codex_home') != str(absolute(home)):
-        raise MaintenanceError('Plan integrity or CODEX_HOME mismatch')
+        raise MaintenanceError('Plan integrity or CODEX_HOME mismatch', 'invalid-plan')
+    operation_id = plan.get('id', '')
+    if not isinstance(operation_id, str) or not re.fullmatch(r'[0-9a-f]{32}', operation_id):
+        raise MaintenanceError('Invalid operation ID', 'invalid-plan')
     target = user_target(home, plan['target'])
     candidate = absolute(plan['candidate'])
     if linked_path(candidate):
@@ -796,22 +858,25 @@ def apply_plan(home, plan):
     require_snapshot(target, plan['diff']['before'])
     require_snapshot(candidate, plan['diff']['after'])
     with state_lock(home) as state:
-        operation_id = plan['id']
-        if not re.fullmatch(r'[0-9a-f]{32}', operation_id):
-            raise MaintenanceError('Invalid operation ID')
         folder = state / 'backups' / operation_id
         if linked_path(folder.parent):
             raise MaintenanceError('Backup parent must not be a symlink')
+        if folder.exists() or is_link(folder):
+            raise MaintenanceError('Plan operation ID was already used; create a fresh plan', 'plan-already-used')
         folder.mkdir(parents=True, mode=0o700, exist_ok=False)
         staged, backup = folder / 'staged', folder / 'original'
-        shutil.copytree(candidate, staged, symlinks=True)
-        require_snapshot(staged, plan['diff']['after'], identity=False)
-        require_snapshot(candidate, plan['diff']['after'])
-        require_snapshot(target, plan['diff']['before'])
-        receipt = {'schema': 1, 'id': operation_id, 'target': str(target), 'backup': str(backup), 'status': 'prepared',
-                   'created_at': now(), 'plan': plan}
         receipt_file = folder / 'receipt.json'
-        write_json(receipt_file, receipt)
+        try:
+            shutil.copytree(candidate, staged, symlinks=True)
+            require_snapshot(staged, plan['diff']['after'], identity=False)
+            require_snapshot(candidate, plan['diff']['after'])
+            require_snapshot(target, plan['diff']['before'])
+            receipt = {'schema': 1, 'id': operation_id, 'target': str(target), 'backup': str(backup), 'status': 'prepared',
+                       'created_at': now(), 'plan': plan}
+            write_json(receipt_file, receipt)
+        except BaseException:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
         try:
             os.replace(target, backup)
             os.replace(staged, target)
@@ -829,15 +894,26 @@ def apply_plan(home, plan):
 
 
 def rollback(home, operation_id):
-    if not re.fullmatch(r'[0-9a-f]{32}', operation_id):
+    if not isinstance(operation_id, str) or not re.fullmatch(r'[0-9a-f]{32}', operation_id):
         raise MaintenanceError('Invalid operation ID')
     with state_lock(home) as state:
         folder = state / 'backups' / operation_id
         if linked_path(folder):
             raise MaintenanceError('Backup must not be a symlink')
-        receipt = json.loads((folder / 'receipt.json').read_text(encoding='utf-8-sig'))
+        receipt_file = folder / 'receipt.json'
+        if is_link(receipt_file):
+            raise MaintenanceError('Receipt must not be a symlink', 'invalid-receipt')
+        if not receipt_file.exists():
+            raise MaintenanceError('Backup receipt not found for operation ID', 'receipt-not-found')
+        receipt = json.loads(receipt_file.read_text(encoding='utf-8-sig'))
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('plan'), dict):
+            raise MaintenanceError('Invalid backup receipt', 'invalid-receipt')
+        if receipt.get('status') == 'rolled-back':
+            raise MaintenanceError('Operation was already rolled back', 'already-rolled-back')
         target = user_target(home, receipt['target'])
         backup, displaced = folder / 'original', folder / 'displaced'
+        if not backup.exists() and not is_link(backup):
+            raise MaintenanceError('Original backup directory is missing; inspect receipt before recovery', 'backup-missing')
         require_snapshot(backup, receipt['plan']['diff']['before'])
         if displaced.exists() or displaced.is_symlink():
             raise MaintenanceError('Rollback already started; inspect receipt and retained directories')
@@ -852,8 +928,34 @@ def rollback(home, operation_id):
                 os.replace(displaced, target)
             raise
         receipt.update(status='rolled-back', rolled_back_at=now(), retained_replacement=str(displaced))
-        write_json(folder / 'receipt.json', receipt)
+        write_json(receipt_file, receipt)
         return receipt
+
+
+def list_backups(home):
+    root = absolute(home) / 'maintenance' / 'backups'
+    if linked_path(root):
+        raise MaintenanceError('Backup root must not contain links or reparse points')
+    rows, errors = [], []
+    if root.exists():
+        for folder in sorted(root.iterdir()):
+            try:
+                if is_link(folder) or not folder.is_dir():
+                    raise MaintenanceError('Invalid backup entry', 'invalid-receipt')
+                receipt_file = folder / 'receipt.json'
+                if is_link(receipt_file):
+                    raise MaintenanceError('Receipt must not be a symlink', 'invalid-receipt')
+                receipt = json.loads(receipt_file.read_text(encoding='utf-8-sig'))
+                if not isinstance(receipt, dict):
+                    raise MaintenanceError('Invalid backup receipt', 'invalid-receipt')
+                rows.append({'id': receipt.get('id', folder.name), 'status': receipt.get('status', 'unknown'),
+                             'target': receipt.get('target'), 'created_at': receipt.get('created_at'),
+                             'rolled_back_at': receipt.get('rolled_back_at'),
+                             'has_original': (folder / 'original').is_dir() and not is_link(folder / 'original'),
+                             'has_displaced': (folder / 'displaced').is_dir() and not is_link(folder / 'displaced')})
+            except (MaintenanceError, OSError, ValueError) as error:
+                errors.append({'path': str(folder), **error_info(error)})
+    return {'schema': 1, 'checked_at': now(), 'backups': rows, 'errors': errors, 'writes_performed': False}
 
 
 def main():
@@ -873,6 +975,9 @@ def main():
     reg.add_argument('--commit')
     reg.add_argument('--ref', default='main')
     reg.add_argument('--note', default='')
+    unreg = sub.add_parser('unregister', help='Archive and remove a registered skill entry from registry.json')
+    unreg.add_argument('target_or_id')
+    unreg.add_argument('--note', default='')
     for command in ('compare', 'plan'):
         cmd = sub.add_parser(command, help='Compare whole directories' if command == 'compare' else 'Preview a user skill replacement; no installation writes')
         cmd.add_argument('target', type=Path)
@@ -881,6 +986,7 @@ def main():
     apply.add_argument('plan_file', type=Path)
     restore = sub.add_parser('rollback', help='Restore backup only if the installed replacement has no later changes')
     restore.add_argument('operation_id')
+    sub.add_parser('backups', help='Read-only summary of recorded replacement backups and receipts')
     validate = sub.add_parser('validate', help='Parse skill frontmatter and invocation policy with an existing YAML parser')
     validate.add_argument('path', type=Path)
     args = parser.parse_args()
@@ -893,6 +999,8 @@ def main():
             if not args.repo and (args.subdir or args.commit):
                 raise MaintenanceError('--subdir/--commit require --repo')
             result = register(args.home, args.path, args.repo, args.subdir, args.commit, args.ref, args.note)
+        elif args.command == 'unregister':
+            result = unregister(args.home, args.target_or_id, args.note)
         elif args.command == 'check-updates':
             result = check_updates(args.home)
         elif args.command == 'compare':
@@ -903,6 +1011,8 @@ def main():
             result = apply_plan(args.home, json.loads(args.plan_file.read_text(encoding='utf-8-sig')))
         elif args.command == 'rollback':
             result = rollback(args.home, args.operation_id)
+        elif args.command == 'backups':
+            result = list_backups(args.home)
         else:
             result = skill_metadata(args.path)
         if args.output:

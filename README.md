@@ -79,9 +79,9 @@ If neither YAML parser is available, choose an existing interpreter with one ins
 
 `inventory` is read-only and defaults to metadata inspection. Add `--deep` for full content hashes. YAML documents are parsed in bounded batches, reducing Ruby process startup overhead while isolating invalid documents; file contents and invocation policies are reread on each run.
 
-`register` persists a verified source or local baseline. `check-updates` reconciles installed user skills with the registry and reads public GitHub metadata for confirmed sources without installing anything. Unregistered skills, unknown sources, failed checks, and an unreadable registry remain explicit in its coverage summary; zero updates does not mean all skills are current.
+`register` persists a verified source (subdirectory or repository root `.`) or local baseline; `unregister` archives and removes a retired entry. `check-updates` reconciles installed user skills with the registry and reads public GitHub metadata for confirmed sources (falling back to subdirectory trees when a repository root tree is truncated) without installing anything. Unregistered skills, unknown sources, failed checks, and an unreadable registry remain explicit in its coverage summary; zero updates does not mean all skills are current.
 
-`compare` and `plan` describe a complete staged candidate. `apply` replaces a reviewed user skill while retaining a backup; `rollback` refuses to overwrite subsequent edits. Plans are not a substitute for user authorization.
+`compare` and `plan` describe a complete staged candidate. `apply` replaces a reviewed user skill while retaining a backup; `rollback` refuses to overwrite subsequent edits; `backups` lists recorded replacement receipts. Plans are not a substitute for user authorization.
 
 Inventory and update reports use `schema=2`; registries, plans, and receipts remain at schema 1. Consumers that need inventory fingerprints must request `inventory --deep`. Read failures retain partial results and sanitized reason codes.
 

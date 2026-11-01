@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,7 @@ class MaintenanceTests(unittest.TestCase):
         (self.candidate / 'added').write_text('x')
         (self.candidate / 'SKILL.md').write_bytes((self.target / 'SKILL.md').read_bytes())
         (self.candidate / 'SKILL.md').chmod(0o444 if os.name == 'nt' else 0o755)
+        self.addCleanup(lambda: (self.candidate / 'SKILL.md').chmod(0o666) if (self.candidate / 'SKILL.md').exists() else None)
         d = m.compare(self.target, self.candidate)
         self.assertEqual(d['added'], ['added'])
         self.assertEqual(d['removed'], ['removed'])
@@ -652,6 +654,104 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(values[0], {'name': 'good'})
         self.assertIsInstance(values[1], m.MaintenanceError)
         self.assertEqual(values[2], {'name': 'other'})
+
+    def test_old_python_version_exits_with_structured_json(self):
+        code = "import runpy, sys; sys.version_info = (3, 9, 6, 'final', 0); runpy.run_path(sys.argv[1], run_name='__main__')"
+        result = subprocess.run([sys.executable, '-B', '-c', code, str(SCRIPT)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr)['code'], 'unsupported-python')
+
+    def test_root_level_skill_registration_and_subdir_normalization(self):
+        tree = {'tree': [{'path': 'SKILL.md', 'type': 'blob', 'mode': '100644', 'sha': 'a' * 40},
+                         {'path': 'scripts/run.py', 'type': 'blob', 'mode': '100755', 'sha': 'b' * 40}]}
+        with patch.object(m, 'github_json', return_value=tree):
+            entry = m.register(self.home, self.target, 'owner/repo', None, 'a' * 40)
+            self.assertEqual(entry['source']['subdir'], '.')
+            self.assertIn('scripts/run.py', entry['upstream_files'])
+        self.assertEqual(m.normalize_subdir('./skills/demo/'), 'skills/demo')
+        self.assertEqual(m.normalize_subdir('./'), '.')
+        for bad_ref in ('', '   ', 'main..next', '/main', 'main/', 'feature branch'):
+            with self.assertRaises(m.MaintenanceError):
+                m.validate_source('owner/repo', '.', 'a' * 40, bad_ref)
+
+    def test_truncated_root_tree_falls_back_to_subtree(self):
+        responses = {
+            f"owner/repo/git/trees/{'a' * 40}?recursive=1": {'truncated': True, 'tree': []},
+            f"owner/repo/git/trees/{'a' * 40}": {'truncated': False, 'tree': [{'path': 'skills', 'type': 'tree', 'sha': 'b' * 40}]},
+            f"owner/repo/git/trees/{'b' * 40}": {'truncated': False, 'tree': [{'path': 'demo', 'type': 'tree', 'sha': 'c' * 40}]},
+            f"owner/repo/git/trees/{'c' * 40}?recursive=1": {
+                'truncated': False,
+                'tree': [{'path': 'SKILL.md', 'type': 'blob', 'mode': '100644', 'sha': 'd' * 40}],
+            },
+        }
+        with patch.object(m, 'github_json', side_effect=lambda route: responses[route]):
+            result = m.github_tree('owner/repo', 'skills/demo', 'a' * 40)
+        self.assertEqual(result, {'SKILL.md': {'git_sha': 'd' * 40, 'executable': False}})
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX file symlinks without elevation')
+    def test_linked_skill_manifest_is_reported(self):
+        outside = self.root / 'outside-SKILL.md'
+        outside.write_text('---\nname: secret\ndescription: outside\n---\n', encoding='utf-8')
+        manifest = self.target / 'SKILL.md'
+        manifest.unlink()
+        manifest.symlink_to(outside)
+        data = m.inventory(self.home)
+        self.assertEqual(len(data['skills']), 1)
+        self.assertEqual(data['skills'][0]['code'], 'linked-metadata')
+        self.assertTrue(data['aliases'])
+        self.assertFalse(data['complete'])
+
+    def test_unregister_archives_entry_and_clears_missing_skill(self):
+        entry = m.register(self.home, self.target, note='temporary skill')
+        shutil.rmtree(self.target)
+        self.assertEqual(m.check_updates(self.home)['summary']['unknown'], 1)
+        removed = m.unregister(self.home, self.target, note='uninstalled by user')
+        self.assertEqual(removed['id'], entry['id'])
+        self.assertEqual(m.check_updates(self.home)['summary']['registered_entries'], 0)
+        history_files = list((self.home / 'maintenance' / 'registry-history').glob('*.json'))
+        self.assertEqual(len(history_files), 1)
+        archived = json.loads(history_files[0].read_text(encoding='utf-8'))
+        self.assertEqual(archived['reason'], 'unregistered')
+        self.assertEqual(archived['entry']['id'], entry['id'])
+        with self.assertRaises(m.MaintenanceError) as raised:
+            m.unregister(self.home, entry['id'])
+        self.assertEqual(raised.exception.code, 'not-registered')
+
+    def test_pre_receipt_apply_failure_cleans_staging_and_allows_retry(self):
+        p = self.plan()
+        with patch.object(m.shutil, 'copytree', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                m.apply_plan(self.home, p)
+        self.assertFalse((self.home / 'maintenance' / 'backups' / p['id']).exists())
+        receipt = m.apply_plan(self.home, p)
+        self.assertEqual(receipt['status'], 'applied')
+        m.rollback(self.home, receipt['id'])
+        with self.assertRaises(m.MaintenanceError) as raised:
+            m.apply_plan(self.home, p)
+        self.assertEqual(raised.exception.code, 'plan-already-used')
+
+    def test_backups_listing_and_rollback_status_guards(self):
+        empty = m.list_backups(self.home)
+        self.assertEqual(empty['backups'], [])
+        self.assertFalse((self.home / 'maintenance').exists())
+        with self.assertRaises(m.MaintenanceError) as raised:
+            m.apply_plan(self.home, ['not-a-dict'])
+        self.assertEqual(raised.exception.code, 'invalid-plan')
+        with self.assertRaises(m.MaintenanceError) as raised:
+            m.rollback(self.home, '0' * 32)
+        self.assertEqual(raised.exception.code, 'receipt-not-found')
+        receipt = m.apply_plan(self.home, self.plan())
+        listed = m.list_backups(self.home)
+        self.assertEqual(len(listed['backups']), 1)
+        self.assertEqual(listed['backups'][0]['status'], 'applied')
+        self.assertTrue(listed['backups'][0]['has_original'])
+        m.rollback(self.home, receipt['id'])
+        after_rb = m.list_backups(self.home)['backups'][0]
+        self.assertEqual(after_rb['status'], 'rolled-back')
+        self.assertTrue(after_rb['has_displaced'])
+        with self.assertRaises(m.MaintenanceError) as raised:
+            m.rollback(self.home, receipt['id'])
+        self.assertEqual(raised.exception.code, 'already-rolled-back')
 
 
 if __name__ == '__main__':
