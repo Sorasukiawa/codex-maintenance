@@ -28,6 +28,10 @@ description: Use when the user asks to audit, update, deduplicate, organize, or 
 - 独立 skill 先核实来源，按固定提交比较整个目录；保留本地定制、调用策略和元数据。仓库提交改变而 skill 目录未变不算更新，来源未知不按同名搜索结果替换。`register` / `unregister` 是持久写入，只读检查时不顺便修改台账。
 - 同名或用途相近不等于重复，移除前比较完整能力并确认替代版实际可发现。`allow_implicit_invocation: false` 未自动出现不是损坏。
 
+## 本机定制的更新维护
+
+更新 Skills 前如存在 `$CODEX_HOME/skill-customizations/`（默认 `~/.codex/skill-customizations/`），先读其中最新记录的 `README.md` 与 `manifest.json`。用户已将需长期保留的受管技能定制迁入独立个人目录，原版入口用稳定名称禁用；不要重新写入缓存或重复启用原版。按记录保留上游新版能力并合并本地触发范围、调用策略和流程精简，不把旧版整个文件覆盖回新版；恢复也先检查后续修改。不要创建后台更新或自动补丁任务。
+
 ## 执行与验证
 
 脚本仅替换真实的用户 skill 直接子目录，拒绝系统、插件和含链接的包；不支持的布局按现场证据人工维护。执行前避开其他任务的活跃修改和加载，保留回执及备份；替换并非整体原子操作，中断后先查回执，回滚不覆盖后续修改。
