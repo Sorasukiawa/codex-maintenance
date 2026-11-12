@@ -30,7 +30,7 @@ description: Use when the user asks to audit, update, deduplicate, organize, or 
 
 ## 本机定制的更新维护
 
-更新 Skills 前如存在 `$CODEX_HOME/skill-customizations/`（默认 `~/.codex/skill-customizations/`），先读其中最新记录的 `README.md` 与 `manifest.json`。用户已将需长期保留的受管技能定制迁入独立个人目录，原版入口用稳定名称禁用；不要重新写入缓存或重复启用原版。按记录保留上游新版能力并合并本地触发范围、调用策略和流程精简，不把旧版整个文件覆盖回新版；恢复也先检查后续修改。不要创建后台更新或自动补丁任务。
+更新 Skills 前先确认个人定制以哪里为准。用户另有集中管理的配置仓库（记录技能来源、钉住的版本和个人补丁）时以它为准，`$CODEX_HOME/skill-customizations/`（默认 `~/.codex/skill-customizations/`）只作历史参考，两者不一致时按配置仓库处理；没有配置仓库时，再读 `skill-customizations` 中最新记录的 `README.md` 与 `manifest.json`。受管技能的定制已迁入独立个人目录、原版入口已用稳定名称禁用时，不要重新写入缓存或重复启用原版。按记录保留上游新版能力并合并本地触发范围、调用策略和流程精简，不把旧版整个文件覆盖回新版；恢复也先检查后续修改。更新个人技能后，同步配置仓库里的版本声明和补丁，让下次恢复拿到新基线。不要创建后台更新或自动补丁任务。
 
 ## 执行与验证
 
